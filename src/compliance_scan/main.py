@@ -2,6 +2,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
+from .logging_setup import configure_logging
 from .audit.db import init_db
 from .api.scan import router as scan_router
 from .api.compliance import router as compliance_router
@@ -9,7 +10,7 @@ from .api.compliance import router as compliance_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialise SQLite schema on startup."""
+    configure_logging()      # <-- sets up logs/compliance_scan.log
     await init_db()
     yield
 

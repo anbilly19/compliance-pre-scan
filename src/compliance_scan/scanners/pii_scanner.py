@@ -36,7 +36,6 @@ _HIGH_SEVERITY_ENTITIES = {
     "US_SSN", "US_PASSPORT", "US_DRIVER_LICENSE",
     "EMAIL_ADDRESS", "PHONE_NUMBER",
 }
-
 _LOW_SEVERITY_ENTITIES = {"DATE_TIME", "NRP"}
 
 
@@ -74,37 +73,13 @@ def _get_analyzer(language: str):
     return analyzer
 
 
-# ---------------------------------------------------------------------------
-# Entity lists
-# ---------------------------------------------------------------------------
+_REGEX_ENTITIES = ["EMAIL_ADDRESS", "PHONE_NUMBER", "IBAN_CODE", "CREDIT_CARD", "IP_ADDRESS"]
+_NER_ENTITIES   = ["PERSON", "LOCATION", "ORGANIZATION"]
+_ALL_ENTITIES   = _REGEX_ENTITIES + _NER_ENTITIES
 
-# High-confidence, low-noise entities — regex-based, worth scanning always
-_REGEX_ENTITIES = [
-    "EMAIL_ADDRESS",
-    "PHONE_NUMBER",
-    "IBAN_CODE",
-    "CREDIT_CARD",
-    "IP_ADDRESS",
-]
-
-# NER-based entities — noisy, only include with a high score floor
-_NER_ENTITIES = [
-    "PERSON",
-    "LOCATION",
-    "ORGANIZATION",
-]
-
-# Omitted entirely (too noisy, near-zero real signal in business docs):
-#   DATE_TIME  — fires on every date/time string
-#   URL        — fires on every hyperlink (not sensitive by itself)
-#   NRP        — fires on "German", "European", etc.
-
-_ALL_ENTITIES = _REGEX_ENTITIES + _NER_ENTITIES
-
-# Score thresholds
-_REGEX_MIN_SCORE = 0.60   # regex-based: high precision, lower floor fine
-_NER_MIN_SCORE   = 0.85   # NER-based: noisy, require high confidence
-_TECHNICAL_BUMP  = 0.05   # raise both floors for technical docs
+_REGEX_MIN_SCORE = 0.60
+_NER_MIN_SCORE   = 0.85
+_TECHNICAL_BUMP  = 0.05
 
 
 def scan_pii(
@@ -128,6 +103,11 @@ def scan_pii(
     is_technical = is_technical_document(text)
     entity_list = entities or _ALL_ENTITIES
 
+    log.debug(
+        "scan_pii start — lang='%s' is_technical=%s entities=%s",
+        lang, is_technical, entity_list,
+    )
+
     try:
         analyzer = _get_analyzer(lang)
     except Exception as exc:
@@ -138,28 +118,32 @@ def scan_pii(
     bump = _TECHNICAL_BUMP if is_technical else 0.0
 
     try:
-        # Use the lowest floor so Presidio returns everything; we filter below
         raw_results = analyzer.analyze(
             text=text,
             entities=entity_list,
             language=lang,
-            score_threshold=_REGEX_MIN_SCORE - 0.05,  # fetch wide, filter tight
+            score_threshold=_REGEX_MIN_SCORE - 0.05,
         )
     except Exception as exc:
         log.error("Presidio analysis failed: %s", exc)
         return []
 
-    # Per-entity-type score filtering
+    log.debug("Presidio raw hits: %d", len(raw_results))
+
+    # Per-entity-type score gate
     filtered_raw = []
     for r in raw_results:
-        if r.entity_type in _NER_ENTITIES:
-            threshold = _NER_MIN_SCORE + bump
-        else:
-            threshold = _REGEX_MIN_SCORE + bump
+        threshold = (_NER_MIN_SCORE if r.entity_type in _NER_ENTITIES else _REGEX_MIN_SCORE) + bump
         if r.score >= threshold:
             filtered_raw.append(r)
+        else:
+            log.debug(
+                "  DROPPED score=%.2f < %.2f  entity=%s  snippet=%r",
+                r.score, threshold, r.entity_type, text[r.start:r.end][:40],
+            )
 
-    # Wrap for FP suppression
+    log.debug("After score gate: %d hits", len(filtered_raw))
+
     hits = [
         PresidioHit(
             entity_type=r.entity_type,
@@ -175,12 +159,21 @@ def scan_pii(
         hits, text, is_technical=is_technical, min_score=_REGEX_MIN_SCORE
     )
 
-    # Deduplicate: if same span is matched by multiple entity types, keep highest score
+    log.debug("After FP suppression: %d hits", len(filtered))
+    for h in filtered:
+        log.debug(
+            "  KEPT entity=%s score=%.2f snippet=%r",
+            h.entity_type, h.score, h.text[:40],
+        )
+
+    # Deduplicate by span
     seen: dict[tuple[int, int], PresidioHit] = {}
     for h in filtered:
         key = (h.start, h.end)
         if key not in seen or h.score > seen[key].score:
             seen[key] = h
+
+    log.debug("Final deduplicated hits: %d", len(seen))
 
     return [
         PIIMatch(
