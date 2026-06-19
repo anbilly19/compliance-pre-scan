@@ -1,18 +1,31 @@
+"""Centralised settings loaded from environment / .env file."""
 from pathlib import Path
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # Audit DB
+    db_path: Path = Path("data/compliance.db")
 
-    db_path: Path = Path("./compliance_audit.db")
-    pii_warn_threshold: int = 1
+    # Scanner thresholds
+    pii_warn_threshold: int = 1   # warn after N PII hits
     secret_warn_threshold: int = 1
-    anomaly_entropy_threshold: float = 7.2
-    anomaly_size_ratio: float = 10.0
-    export_pseudonymise_users: bool = True
-    keyword_rules_dir: Path = Path("./rules/keywords")
-    secret_rules_file: Path = Path("./rules/secrets/patterns.yaml")
+    keyword_warn_threshold: int = 1
+
+    # Anomaly heuristics
+    entropy_high_threshold: float = 7.2   # bits/byte (max is 8)
+    size_ratio_threshold: float = 50.0    # bytes-per-text-char; above = suspicious
+    max_archive_depth: int = 2
+
+    # Export
+    export_pseudonymise_users: bool = False  # set True in production
+
+    # Custom keyword lists (comma-separated paths to YAML files)
+    keyword_config_paths: list[Path] = [Path("config/keywords.yml")]
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
 
 
 settings = Settings()

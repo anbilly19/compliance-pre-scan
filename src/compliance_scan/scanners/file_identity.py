@@ -1,93 +1,67 @@
-"""File identity checker: MIME type detection vs declared extension."""
-import io
+"""MIME-type detection using puremagic (pure Python, no C deps)."""
 from dataclasses import dataclass
 from pathlib import Path
 
 import puremagic
 
-# Map of lowercase extensions to their expected MIME type prefixes.
-# We check that detected MIME *starts with* one of the allowed values.
-EXTENSION_MIME_MAP: dict[str, list[str]] = {
-    ".pdf":  ["application/pdf"],
-    ".docx": [
-        "application/vnd.openxmlformats-officedocument.wordprocessingml",
-        "application/zip",  # OOXML is a zip container; puremagic may return this
-    ],
-    ".xlsx": [
-        "application/vnd.openxmlformats-officedocument.spreadsheetml",
-        "application/zip",
-    ],
-    ".txt":  ["text/plain", "text/"],
-    ".rtf":  ["text/rtf", "application/rtf"],
+# Allowlist of MIME types the platform accepts
+_ALLOWED_MIMES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "text/plain",
+    "text/rtf",
+    "application/rtf",
+    "application/msword",         # legacy .doc
+    "application/vnd.ms-excel",   # legacy .xls
 }
 
-# MIME prefixes that are immediately suspicious regardless of extension
-SUSPICIOUS_MIME_PREFIXES: list[str] = [
-    "application/x-dosexec",   # PE executable
-    "application/x-executable",
-    "application/x-sharedlib",
-    "application/x-mach-binary",
-    "application/x-sh",
-    "application/x-shellscript",
-]
+_EXT_MIME_MAP = {
+    ".pdf":  "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc":  "application/msword",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsm": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".txt":  "text/plain",
+    ".rtf":  "text/rtf",
+}
 
 
 @dataclass
-class FileIdentityResult:
-    filename: str
-    extension: str
-    declared_mime: str          # MIME implied by extension
-    detected_mime: str          # MIME from magic bytes (best guess)
+class FileIdentity:
+    mime_detected: str
+    mime_from_extension: str
     extension_mismatch: bool
-    is_suspicious_type: bool
-    note: str = ""
+    is_allowed_type: bool
 
 
-def check_file_identity(data: bytes, filename: str) -> FileIdentityResult:
-    """
-    Detect the actual MIME type from file bytes and compare against
-    the declared extension.
-    """
-    ext = Path(filename).suffix.lower()
-    allowed_mimes = EXTENSION_MIME_MAP.get(ext, [])
-    declared_mime = allowed_mimes[0] if allowed_mimes else "unknown"
+def identify_file(path: Path) -> FileIdentity:
+    """Detect true MIME type and compare against declared extension."""
+    ext = path.suffix.lower()
+    mime_from_ext = _EXT_MIME_MAP.get(ext, "application/octet-stream")
 
-    # puremagic returns a list of MagicMatch sorted by confidence
+    mime_detected = "application/octet-stream"
     try:
-        matches = puremagic.magic_string(data)
-        detected_mime = matches[0].mime_type if matches else "application/octet-stream"
-    except Exception:
-        detected_mime = "application/octet-stream"
+        matches = puremagic.magic_file(str(path))
+        if matches:
+            # puremagic returns a list of PureMagicWithConfidence; take highest confidence
+            matches.sort(key=lambda m: m.confidence, reverse=True)
+            mime_detected = matches[0].mime_type or "application/octet-stream"
+    except Exception:  # noqa: BLE001
+        pass
 
-    # Check for suspicious binaries first
-    is_suspicious_type = any(
-        detected_mime.startswith(p) for p in SUSPICIOUS_MIME_PREFIXES
+    # Mismatch: detected type and extension-expected type differ in major family
+    def _major(mime: str) -> str:
+        return mime.split("/")[0]
+
+    mismatch = (
+        mime_detected != "application/octet-stream"
+        and _major(mime_detected) != _major(mime_from_ext)
     )
 
-    # Extension mismatch: detected MIME doesn't match any allowed for this ext
-    if allowed_mimes:
-        extension_mismatch = not any(
-            detected_mime.startswith(m) for m in allowed_mimes
-        )
-    else:
-        # Unknown extension — flag it
-        extension_mismatch = True
-
-    note_parts = []
-    if extension_mismatch:
-        note_parts.append(
-            f"Extension '{ext}' expects MIME like '{declared_mime}' "
-            f"but detected '{detected_mime}'"
-        )
-    if is_suspicious_type:
-        note_parts.append(f"Detected MIME '{detected_mime}' is a known executable/script type")
-
-    return FileIdentityResult(
-        filename=filename,
-        extension=ext,
-        declared_mime=declared_mime,
-        detected_mime=detected_mime,
-        extension_mismatch=extension_mismatch,
-        is_suspicious_type=is_suspicious_type,
-        note="; ".join(note_parts),
+    return FileIdentity(
+        mime_detected=mime_detected,
+        mime_from_extension=mime_from_ext,
+        extension_mismatch=mismatch,
+        is_allowed_type=mime_detected in _ALLOWED_MIMES or mime_from_ext in _ALLOWED_MIMES,
     )

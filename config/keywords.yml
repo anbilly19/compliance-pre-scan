@@ -1,0 +1,15 @@
+# Custom keyword lists for your organisation.
+# Extend this file with project code names, client names, internal IDs, etc.
+# Both plain strings (whole-word, case-insensitive) and 're:' prefixed regexes are supported.
+
+categories:
+  - name: example_project_names
+    severity: HIGH
+    terms:
+      - PROJECT_ALPHA
+      - re:"Projekt\s+\w+"
+
+  - name: example_client_ids
+    severity: MEDIUM
+    terms:
+      - CLIENT-0001
