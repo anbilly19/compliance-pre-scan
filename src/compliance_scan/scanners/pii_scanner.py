@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import List
 
+from ..audit.models import RuleHit
+
 log = logging.getLogger(__name__)
 
 
@@ -37,12 +39,12 @@ class PIIMatch:
 _HIGH_SEVERITY_ENTITIES = {
     "CREDIT_CARD", "IBAN_CODE", "MEDICAL_LICENSE",
     "US_SSN", "US_PASSPORT", "US_DRIVER_LICENSE",
-    "EMAIL_ADDRESS",  # treat email as high — direct contact info
+    "EMAIL_ADDRESS",
     "PHONE_NUMBER",
 }
 
 _LOW_SEVERITY_ENTITIES = {
-    "DATE_TIME", "NRP",  # nationality / religion / politics — low by default
+    "DATE_TIME", "NRP",
 }
 
 
@@ -115,17 +117,7 @@ def scan_pii(
     entities: list[str] | None = None,
     min_score: float = 0.65,
 ) -> list[PIIMatch]:
-    """Scan text for PII and return filtered matches.
-
-    Args:
-        text: Extracted document text.
-        language: 'en' or 'de'. Auto-detected if None.
-        entities: Presidio entity list. Defaults to _DEFAULT_ENTITIES.
-        min_score: Base confidence threshold (raised for technical docs).
-
-    Returns:
-        List of PIIMatch, false positives removed.
-    """
+    """Scan text for PII and return filtered matches."""
     if not text or not text.strip():
         return []
 
@@ -145,7 +137,10 @@ def scan_pii(
     try:
         analyzer = _get_analyzer(lang)
     except Exception as exc:
-        log.warning("Failed to load Presidio analyzer for lang='%s': %s — falling back to 'en'", lang, exc)
+        log.warning(
+            "Failed to load Presidio analyzer for lang='%s': %s — falling back to 'en'",
+            lang, exc,
+        )
         analyzer = _get_analyzer("en")
         lang = "en"
 
@@ -160,7 +155,8 @@ def scan_pii(
         log.error("Presidio analysis failed: %s", exc)
         return []
 
-    # Wrap into our dataclass for filtering
+    from .false_positive_filter import PresidioHit, suppress_false_positives
+
     hits = [
         PresidioHit(
             entity_type=r.entity_type,
@@ -184,3 +180,35 @@ def scan_pii(
         )
         for h in filtered
     ]
+
+
+class PIIScanner:
+    """Stateless class wrapper around scan_pii for use in the pipeline."""
+
+    def __init__(
+        self,
+        entities: list[str] | None = None,
+        min_score: float = 0.65,
+    ) -> None:
+        self._entities = entities
+        self._min_score = min_score
+
+    def scan(self, text: str, language: str | None = None) -> list[RuleHit]:
+        """Run PII scan and return RuleHit list compatible with pipeline."""
+        matches = scan_pii(
+            text,
+            language=language,
+            entities=self._entities,
+            min_score=self._min_score,
+        )
+        return [
+            RuleHit(
+                scanner="PII",
+                rule_id=f"PII:{m.entity_type}",
+                entity_type=m.entity_type,
+                severity=m.severity,
+                offset_char=m.start,
+                match_snippet=m.match_snippet,
+            )
+            for m in matches
+        ]
