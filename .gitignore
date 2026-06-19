@@ -1,4 +1,33 @@
-*.pyc
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
 .env
+*.env
+
+# uv
+.uv/
+
+# Logs (keep folder, ignore files)
+logs/*.log
+logs/*.log.*
+
+# DB
 *.db
+*.sqlite
+*.sqlite3
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# OS
+.DS_Store
+Thumbs.db
 tests/fixtures/Anfrage Seitenrolle_rev1.pdf
