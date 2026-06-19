@@ -15,7 +15,6 @@ import streamlit as st
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
-# ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Compliance Pre-Scan",
     page_icon="🛡️",
@@ -23,22 +22,37 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Minimal CSS ───────────────────────────────────────────────────────────────
+# ── CSS — explicit dark text on all cards so both light and dark mode work ────
 st.markdown("""
 <style>
-.risk-clean    { background:#d4edda; color:#155724; border-radius:6px; padding:2px 10px; font-weight:600; }
-.risk-warn     { background:#fff3cd; color:#856404; border-radius:6px; padding:2px 10px; font-weight:600; }
-.risk-high     { background:#f8d7da; color:#721c24; border-radius:6px; padding:2px 10px; font-weight:600; }
-.hit-card      { border-left:4px solid #dc3545; background:#fff5f5; border-radius:4px;
-                 padding:8px 12px; margin-bottom:6px; font-size:0.88rem; }
-.hit-card-med  { border-left-color:#fd7e14; background:#fff8f0; }
-.hit-card-low  { border-left-color:#0dcaf0; background:#f0faff; }
+/* Risk badges */
+.risk-clean  { background:#1e7e34; color:#ffffff !important; border-radius:6px;
+               padding:3px 12px; font-weight:700; display:inline-block; }
+.risk-warn   { background:#d39e00; color:#ffffff !important; border-radius:6px;
+               padding:3px 12px; font-weight:700; display:inline-block; }
+.risk-high   { background:#b21f2d; color:#ffffff !important; border-radius:6px;
+               padding:3px 12px; font-weight:700; display:inline-block; }
+
+/* Hit cards — always dark text regardless of Streamlit theme */
+.hit-card     { border-left:4px solid #dc3545; background:#2a1215;
+                border-radius:4px; padding:9px 14px; margin-bottom:7px;
+                font-size:0.88rem; color:#f8d7da !important; }
+.hit-card-med { border-left:4px solid #fd7e14; background:#2a1a08;
+                border-radius:4px; padding:9px 14px; margin-bottom:7px;
+                font-size:0.88rem; color:#ffe8cc !important; }
+.hit-card-low { border-left:4px solid #0dcaf0; background:#07282e;
+                border-radius:4px; padding:9px 14px; margin-bottom:7px;
+                font-size:0.88rem; color:#cff4fc !important; }
+.hit-card     b, .hit-card-med b, .hit-card-low b  { font-weight:700; }
+.hit-card     code, .hit-card-med code, .hit-card-low code {
+    background:rgba(255,255,255,0.12); color:inherit !important;
+    padding:1px 5px; border-radius:3px; font-size:0.85em;
+}
 </style>
 """, unsafe_allow_html=True)
 
 # ── Sidebar nav ───────────────────────────────────────────────────────────────
-st.sidebar.image("https://cdn.simpleicons.org/shield/01696f", width=40)
-st.sidebar.title("Compliance Pre-Scan")
+st.sidebar.title("🛡️ Compliance Pre-Scan")
 page = st.sidebar.radio(
     "Navigation",
     ["📤 Upload & Scan", "📋 Audit Trail", "📥 Betriebsrat Export"],
@@ -73,15 +87,18 @@ def _severity_class(sev: str) -> str:
 def _render_hits(title: str, hits: list[dict], color: str) -> None:
     if not hits:
         return
-    with st.expander(f"{title} ({len(hits)} hit{'s' if len(hits)!=1 else ''})", expanded=True):
+    with st.expander(f"{title} ({len(hits)} hit{'s' if len(hits) != 1 else ''})", expanded=True):
         for h in hits:
             css = _severity_class(h.get("severity", "LOW"))
             snippet = h.get("match_snippet", "")
-            rule = h.get("rule_id", "")
-            entity = h.get("entity_type") or rule
+            rule    = h.get("rule_id", "")
+            entity  = h.get("entity_type") or rule
+            offset  = h.get("offset_char", "")
             st.markdown(
                 f'<div class="{css}">'
-                f'<b>{entity}</b> &nbsp;·&nbsp; severity: {h.get("severity","?")}'
+                f'<b>{entity}</b>'
+                f' &nbsp;·&nbsp; severity: {h.get("severity", "?")}'
+                f'{" &nbsp;·&nbsp; offset: " + str(offset) if offset != "" else ""}'
                 f'{" &nbsp;·&nbsp; <code>" + snippet + "</code>" if snippet else ""}'
                 f'</div>',
                 unsafe_allow_html=True,
@@ -106,7 +123,7 @@ if page == "📤 Upload & Scan":
             help="Supported: PDF, DOCX, TXT, XLSX, RTF",
         )
     with col2:
-        user_id = st.text_input("User ID", value="demo-user", help="Passed to audit trail")
+        user_id    = st.text_input("User ID",    value="demo-user",    help="Passed to audit trail")
         session_id = st.text_input("Session ID", value="demo-session")
 
     if uploaded and st.button("🔍 Scan file", type="primary"):
@@ -125,10 +142,9 @@ if page == "📤 Upload & Scan":
                 st.stop()
 
         decision = result.get("decision", "ALLOW")
-        risk = result.get("risk_level", "CLEAN")
+        risk     = result.get("risk_level", "CLEAN")
         duration = result.get("scan_duration_ms", 0)
 
-        # ── Decision banner ──
         if decision == "ALLOW":
             st.success(f"✅ **ALLOW** — no sensitive content detected. ({duration} ms)")
         elif decision == "ALLOW_WITH_WARNING":
@@ -139,32 +155,28 @@ if page == "📤 Upload & Scan":
         else:
             st.error(f"🚫 **BLOCKED** — upload prevented by compliance policy. ({duration} ms)")
 
-        # ── Summary row ──
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Risk level", risk)
-        c2.metric("PII hits", len(result.get("pii_matches", [])))
-        c3.metric("Secret hits", len(result.get("secret_matches", [])))
-        c4.metric("Keyword hits", len(result.get("keyword_matches", [])))
+        c1.metric("Risk level",    risk)
+        c2.metric("PII hits",      len(result.get("pii_matches", [])))
+        c3.metric("Secret hits",   len(result.get("secret_matches", [])))
+        c4.metric("Keyword hits",  len(result.get("keyword_matches", [])))
         c5.metric("Anomaly flags", len(result.get("anomaly_matches", [])))
 
         st.markdown("---")
 
-        # ── File identity ──
-        with st.expander("File identity", expanded=False):
+        with st.expander("🗂 File identity", expanded=False):
             st.json({
-                "filename": result.get("filename"),
-                "detected_type": result.get("file_type_detected"),
-                "declared_type": result.get("file_type_declared"),
+                "filename":          result.get("filename"),
+                "detected_type":     result.get("file_type_detected"),
+                "declared_type":     result.get("file_type_declared"),
                 "extension_mismatch": result.get("extension_mismatch"),
             })
 
-        # ── Hit details ──
-        _render_hits("🔑 Secrets",    result.get("secret_matches", []),  "#dc3545")
-        _render_hits("👤 PII",        result.get("pii_matches", []),     "#fd7e14")
+        _render_hits("🔑 Secrets",   result.get("secret_matches",  []), "#dc3545")
+        _render_hits("👤 PII",        result.get("pii_matches",     []), "#fd7e14")
         _render_hits("🔤 Keywords",   result.get("keyword_matches", []), "#6f42c1")
         _render_hits("⚠️ Anomalies",  result.get("anomaly_matches", []), "#0dcaf0")
 
-        # ── Store in session for easy re-review ──
         st.session_state["last_result"] = result
 
     elif "last_result" in st.session_state:
@@ -179,17 +191,17 @@ elif page == "📋 Audit Trail":
 
     with st.form("filter_form"):
         fc1, fc2, fc3, fc4 = st.columns(4)
-        f_user   = fc1.text_input("User ID (optional)")
-        f_from   = fc2.date_input("From date", value=None)
-        f_to     = fc3.date_input("To date",   value=None)
-        f_limit  = fc4.number_input("Max rows", min_value=10, max_value=500, value=100)
+        f_user  = fc1.text_input("User ID (optional)")
+        f_from  = fc2.date_input("From date", value=None)
+        f_to    = fc3.date_input("To date",   value=None)
+        f_limit = fc4.number_input("Max rows", min_value=10, max_value=500, value=100)
         submitted = st.form_submit_button("🔎 Load events")
 
     if submitted or "audit_df" in st.session_state:
         params: dict = {"limit": int(f_limit)}
-        if f_user:  params["user_id"]   = f_user
-        if f_from:  params["from_date"] = str(f_from)
-        if f_to:    params["to_date"]   = str(f_to)
+        if f_user: params["user_id"]   = f_user
+        if f_from: params["from_date"] = str(f_from)
+        if f_to:   params["to_date"]   = str(f_to)
 
         if submitted:
             with st.spinner("Loading…"):
@@ -207,8 +219,6 @@ elif page == "📋 Audit Trail":
             st.info("No events found for the selected filters.")
         else:
             df = pd.DataFrame(events)
-
-            # Friendly display columns
             display_cols = [
                 "timestamp", "user_id", "filename",
                 "risk_level", "decision",
@@ -217,18 +227,16 @@ elif page == "📋 Audit Trail":
             ]
             df = df[[c for c in display_cols if c in df.columns]]
 
-            # Colour-code risk level
-            def _style_risk(val):
-                colour = {
-                    "CLEAN": "background-color:#d4edda;color:#155724",
-                    "SENSITIVE_PII": "background-color:#fff3cd;color:#856404",
-                    "SECRET_FOUND": "background-color:#f8d7da;color:#721c24",
-                    "STRUCTURAL_ANOMALY": "background-color:#f8d7da;color:#721c24",
+            def _style_risk(val: str) -> str:
+                return {
+                    "CLEAN":            "background-color:#1e7e34;color:#ffffff",
+                    "SENSITIVE_PII":    "background-color:#856404;color:#ffffff",
+                    "SECRET_FOUND":     "background-color:#721c24;color:#ffffff",
+                    "STRUCTURAL_ANOMALY": "background-color:#721c24;color:#ffffff",
                 }.get(val, "")
-                return colour
 
-            styled = df.style.applymap(_style_risk, subset=["risk_level"] if "risk_level" in df.columns else [])
-
+            subset = ["risk_level"] if "risk_level" in df.columns else []
+            styled = df.style.applymap(_style_risk, subset=subset)
             st.markdown(f"**{len(df)} events**")
             st.dataframe(styled, use_container_width=True, height=500)
 
@@ -245,16 +253,16 @@ elif page == "📥 Betriebsrat Export":
 
     with st.form("export_form"):
         ec1, ec2, ec3 = st.columns(3)
-        e_user  = ec1.text_input("User ID (leave blank for all)")
-        e_from  = ec2.date_input("From date", value=None)
-        e_to    = ec3.date_input("To date",   value=None)
+        e_user = ec1.text_input("User ID (leave blank for all)")
+        e_from = ec2.date_input("From date", value=None)
+        e_to   = ec3.date_input("To date",   value=None)
         export_btn = st.form_submit_button("⬇️ Generate CSV", type="primary")
 
     if export_btn:
         params: dict = {}
-        if e_user:  params["user_id"]   = e_user
-        if e_from:  params["from_date"] = str(e_from)
-        if e_to:    params["to_date"]   = str(e_to)
+        if e_user: params["user_id"]   = e_user
+        if e_from: params["from_date"] = str(e_from)
+        if e_to:   params["to_date"]   = str(e_to)
 
         with st.spinner("Generating export…"):
             try:
@@ -277,7 +285,6 @@ elif page == "📥 Betriebsrat Export":
             mime="text/csv",
         )
 
-        # Preview first 20 rows
         import io
         try:
             preview_df = pd.read_csv(io.BytesIO(csv_bytes), encoding="utf-8-sig", nrows=20)
