@@ -39,6 +39,10 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/compliance_scan"]
 
+# ── uv: install the package itself in editable mode so `src/` is on sys.path ──
+[tool.uv]
+package = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
