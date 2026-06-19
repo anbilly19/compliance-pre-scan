@@ -1,3 +1,4 @@
 *.pyc
 .env
 *.db
+tests/fixtures/Anfrage Seitenrolle_rev1.pdf
