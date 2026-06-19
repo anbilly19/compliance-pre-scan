@@ -1,15 +1,22 @@
 """Integration tests for the FastAPI endpoints."""
 import pytest
 from httpx import ASGITransport, AsyncClient
-from pathlib import Path
 
 from compliance_scan.api.app import app
 from compliance_scan.audit import db as audit_db
 
 
 @pytest.fixture(autouse=True)
-def tmp_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(audit_db.settings, "db_path", tmp_path / "test.db")
+async def tmp_db(tmp_path, monkeypatch):
+    """
+    Point the DB at a fresh temp file for every test, then create the schema.
+    Must be async so we can await init_db() after patching.
+    ASGITransport does not fire the FastAPI lifespan, so we initialise
+    the DB explicitly here instead of relying on the startup hook.
+    """
+    db_file = tmp_path / "test.db"
+    monkeypatch.setattr(audit_db.settings, "db_path", db_file)
+    await audit_db.init_db()
 
 
 @pytest.mark.asyncio
