@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class PIIMatch:
     entity_type: str
-    text: str
+    text: str          # raw matched text, NOT masked
     score: float
     start: int
     end: int
@@ -27,7 +27,8 @@ class PIIMatch:
     match_snippet: str = ""
 
     def __post_init__(self) -> None:
-        self.match_snippet = _mask_snippet(self.text)
+        # During testing we keep the full text as snippet (no masking)
+        self.match_snippet = self.text
         self.severity = _entity_severity(self.entity_type)
 
 
@@ -45,13 +46,6 @@ def _entity_severity(entity_type: str) -> str:
     if entity_type in _LOW_SEVERITY_ENTITIES:
         return "LOW"
     return "MEDIUM"
-
-
-def _mask_snippet(text: str) -> str:
-    t = text.strip()
-    if len(t) <= 4:
-        return "**"
-    return t[:2] + "***" + t[-2:]
 
 
 @lru_cache(maxsize=None)
@@ -88,7 +82,6 @@ def scan_pii(
     entities: list[str] | None = None,
     min_score: float = _REGEX_MIN_SCORE,
 ) -> list[PIIMatch]:
-    """Scan text for PII and return deduplicated, filtered matches."""
     if not text or not text.strip():
         return []
 
@@ -99,19 +92,16 @@ def scan_pii(
         suppress_false_positives,
     )
 
-    lang = language or detect_language(text)
+    lang         = language or detect_language(text)
     is_technical = is_technical_document(text)
-    entity_list = entities or _ALL_ENTITIES
+    entity_list  = entities or _ALL_ENTITIES
 
-    log.debug(
-        "scan_pii start — lang='%s' is_technical=%s entities=%s",
-        lang, is_technical, entity_list,
-    )
+    log.debug("scan_pii start lang='%s' is_technical=%s entities=%s", lang, is_technical, entity_list)
 
     try:
         analyzer = _get_analyzer(lang)
     except Exception as exc:
-        log.warning("Analyzer load failed lang='%s': %s — fallback to 'en'", lang, exc)
+        log.warning("Analyzer load failed lang='%s': %s - fallback to 'en'", lang, exc)
         analyzer = _get_analyzer("en")
         lang = "en"
 
@@ -130,17 +120,14 @@ def scan_pii(
 
     log.debug("Presidio raw hits: %d", len(raw_results))
 
-    # Per-entity-type score gate
     filtered_raw = []
     for r in raw_results:
         threshold = (_NER_MIN_SCORE if r.entity_type in _NER_ENTITIES else _REGEX_MIN_SCORE) + bump
+        snippet   = text[r.start:r.end]
         if r.score >= threshold:
             filtered_raw.append(r)
         else:
-            log.debug(
-                "  DROPPED score=%.2f < %.2f  entity=%s  snippet=%r",
-                r.score, threshold, r.entity_type, text[r.start:r.end][:40],
-            )
+            log.debug("  SCORE-DROP entity=%-20s score=%.2f < %.2f  text=%r", r.entity_type, r.score, threshold, snippet)
 
     log.debug("After score gate: %d hits", len(filtered_raw))
 
@@ -155,16 +142,11 @@ def scan_pii(
         for r in filtered_raw
     ]
 
-    filtered = suppress_false_positives(
-        hits, text, is_technical=is_technical, min_score=_REGEX_MIN_SCORE
-    )
+    filtered = suppress_false_positives(hits, text, is_technical=is_technical, min_score=_REGEX_MIN_SCORE)
 
     log.debug("After FP suppression: %d hits", len(filtered))
     for h in filtered:
-        log.debug(
-            "  KEPT entity=%s score=%.2f snippet=%r",
-            h.entity_type, h.score, h.text[:40],
-        )
+        log.debug("  KEPT  entity=%-20s score=%.2f  text=%r", h.entity_type, h.score, h.text)
 
     # Deduplicate by span
     seen: dict[tuple[int, int], PresidioHit] = {}
@@ -173,7 +155,7 @@ def scan_pii(
         if key not in seen or h.score > seen[key].score:
             seen[key] = h
 
-    log.debug("Final deduplicated hits: %d", len(seen))
+    log.debug("Final deduplicated PII hits: %d", len(seen))
 
     return [
         PIIMatch(
@@ -188,23 +170,12 @@ def scan_pii(
 
 
 class PIIScanner:
-    """Pipeline-compatible class wrapper around scan_pii."""
-
-    def __init__(
-        self,
-        entities: list[str] | None = None,
-        min_score: float = _REGEX_MIN_SCORE,
-    ) -> None:
-        self._entities = entities
+    def __init__(self, entities: list[str] | None = None, min_score: float = _REGEX_MIN_SCORE) -> None:
+        self._entities  = entities
         self._min_score = min_score
 
     def scan(self, text: str, language: str | None = None) -> list[RuleHit]:
-        matches = scan_pii(
-            text,
-            language=language,
-            entities=self._entities,
-            min_score=self._min_score,
-        )
+        matches = scan_pii(text, language=language, entities=self._entities, min_score=self._min_score)
         return [
             RuleHit(
                 scanner="PII",
@@ -212,7 +183,7 @@ class PIIScanner:
                 entity_type=m.entity_type,
                 severity=m.severity,
                 offset_char=m.start,
-                match_snippet=m.match_snippet,
+                match_snippet=m.match_snippet,  # full unmasked text in test mode
             )
             for m in matches
         ]
