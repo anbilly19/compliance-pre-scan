@@ -20,7 +20,6 @@ async def test_scan_clean_txt(tmp_path):
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
-        await app.router.startup()
         resp = await client.post(
             "/scan",
             data={"user_id": "user-001", "session_id": "s1"},
@@ -43,7 +42,6 @@ async def test_scan_with_secret(tmp_path):
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
-        await app.router.startup()
         resp = await client.post(
             "/scan",
             data={"user_id": "user-001", "session_id": "s1"},
@@ -61,7 +59,6 @@ async def test_export_csv():
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
-        await app.router.startup()
         resp = await client.get("/events/export")
 
     assert resp.status_code == 200

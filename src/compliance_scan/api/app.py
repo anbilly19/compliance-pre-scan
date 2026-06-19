@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -14,16 +15,19 @@ from ..audit.export import generate_csv
 from ..audit.models import ScanResult
 from ..pipeline import run_scan
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+
+
 app = FastAPI(
     title="Compliance Pre-Scan",
     version="0.1.0",
     description="Local pre-upload content security scanner.",
+    lifespan=lifespan,
 )
-
-
-@app.on_event("startup")
-async def startup() -> None:
-    await init_db()
 
 
 @app.post("/scan", response_model=ScanResult)
@@ -44,7 +48,6 @@ async def scan_file(
     content = await file.read()
     filename = file.filename or "unknown"
 
-    # Write to a temp file so scanners can read by Path
     suffix = Path(filename).suffix or ".bin"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(content)
@@ -99,7 +102,7 @@ async def export_events(
     )
     csv_content = generate_csv(events)
     return StreamingResponse(
-        io.BytesIO(csv_content.encode("utf-8-sig")),  # BOM for Excel compat
+        io.BytesIO(csv_content.encode("utf-8-sig")),
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="compliance_export.csv"'},
     )
