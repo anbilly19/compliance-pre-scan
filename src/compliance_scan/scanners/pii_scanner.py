@@ -1,9 +1,5 @@
 """PII scanner using Microsoft Presidio with bilingual support (EN + DE).
 
-Loads both English and German NLP models.  Language is auto-detected per
-document via detect_language().  False positives are suppressed via
-false_positive_filter before results are returned.
-
 German spaCy model: de_core_news_md  (MIT / CC-BY-SA-3.0)
 English spaCy model: en_core_web_md  (MIT)
 Presidio: MIT
@@ -12,9 +8,8 @@ langdetect: Apache-2.0
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import List
 
 from ..audit.models import RuleHit
 
@@ -39,13 +34,10 @@ class PIIMatch:
 _HIGH_SEVERITY_ENTITIES = {
     "CREDIT_CARD", "IBAN_CODE", "MEDICAL_LICENSE",
     "US_SSN", "US_PASSPORT", "US_DRIVER_LICENSE",
-    "EMAIL_ADDRESS",
-    "PHONE_NUMBER",
+    "EMAIL_ADDRESS", "PHONE_NUMBER",
 }
 
-_LOW_SEVERITY_ENTITIES = {
-    "DATE_TIME", "NRP",
-}
+_LOW_SEVERITY_ENTITIES = {"DATE_TIME", "NRP"}
 
 
 def _entity_severity(entity_type: str) -> str:
@@ -57,29 +49,19 @@ def _entity_severity(entity_type: str) -> str:
 
 
 def _mask_snippet(text: str) -> str:
-    """Return first 2 + last 2 chars with middle masked, max 12 chars shown."""
     t = text.strip()
     if len(t) <= 4:
         return "**"
     return t[:2] + "***" + t[-2:]
 
 
-# ---------------------------------------------------------------------------
-# Lazy-loaded Presidio engines (one per language)
-# ---------------------------------------------------------------------------
-
 @lru_cache(maxsize=None)
 def _get_analyzer(language: str):
-    """Return a cached PresidioAnalyzerEngine for the given language."""
     from presidio_analyzer import AnalyzerEngine
     from presidio_analyzer.nlp_engine import NlpEngineProvider
 
-    model_map = {
-        "en": "en_core_web_md",
-        "de": "de_core_news_md",
-    }
+    model_map = {"en": "en_core_web_md", "de": "de_core_news_md"}
     spacy_model = model_map.get(language, "en_core_web_md")
-
     provider = NlpEngineProvider(
         nlp_configuration={
             "nlp_engine_name": "spacy",
@@ -88,36 +70,50 @@ def _get_analyzer(language: str):
     )
     nlp_engine = provider.create_engine()
     analyzer = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=[language])
-    log.info("Presidio AnalyzerEngine loaded for language='%s' model='%s'", language, spacy_model)
+    log.info("Presidio loaded lang='%s' model='%s'", language, spacy_model)
     return analyzer
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Entity lists
 # ---------------------------------------------------------------------------
 
-_DEFAULT_ENTITIES = [
-    "PERSON",
+# High-confidence, low-noise entities — regex-based, worth scanning always
+_REGEX_ENTITIES = [
     "EMAIL_ADDRESS",
     "PHONE_NUMBER",
     "IBAN_CODE",
     "CREDIT_CARD",
-    "LOCATION",
-    "DATE_TIME",
-    "ORGANIZATION",
     "IP_ADDRESS",
-    "URL",
-    "NRP",
 ]
+
+# NER-based entities — noisy, only include with a high score floor
+_NER_ENTITIES = [
+    "PERSON",
+    "LOCATION",
+    "ORGANIZATION",
+]
+
+# Omitted entirely (too noisy, near-zero real signal in business docs):
+#   DATE_TIME  — fires on every date/time string
+#   URL        — fires on every hyperlink (not sensitive by itself)
+#   NRP        — fires on "German", "European", etc.
+
+_ALL_ENTITIES = _REGEX_ENTITIES + _NER_ENTITIES
+
+# Score thresholds
+_REGEX_MIN_SCORE = 0.60   # regex-based: high precision, lower floor fine
+_NER_MIN_SCORE   = 0.85   # NER-based: noisy, require high confidence
+_TECHNICAL_BUMP  = 0.05   # raise both floors for technical docs
 
 
 def scan_pii(
     text: str,
     language: str | None = None,
     entities: list[str] | None = None,
-    min_score: float = 0.65,
+    min_score: float = _REGEX_MIN_SCORE,
 ) -> list[PIIMatch]:
-    """Scan text for PII and return filtered matches."""
+    """Scan text for PII and return deduplicated, filtered matches."""
     if not text or not text.strip():
         return []
 
@@ -130,33 +126,40 @@ def scan_pii(
 
     lang = language or detect_language(text)
     is_technical = is_technical_document(text)
-
-    if is_technical:
-        log.debug("Document classified as TECHNICAL — raising suppression thresholds")
+    entity_list = entities or _ALL_ENTITIES
 
     try:
         analyzer = _get_analyzer(lang)
     except Exception as exc:
-        log.warning(
-            "Failed to load Presidio analyzer for lang='%s': %s — falling back to 'en'",
-            lang, exc,
-        )
+        log.warning("Analyzer load failed lang='%s': %s — fallback to 'en'", lang, exc)
         analyzer = _get_analyzer("en")
         lang = "en"
 
+    bump = _TECHNICAL_BUMP if is_technical else 0.0
+
     try:
+        # Use the lowest floor so Presidio returns everything; we filter below
         raw_results = analyzer.analyze(
             text=text,
-            entities=entities or _DEFAULT_ENTITIES,
+            entities=entity_list,
             language=lang,
-            score_threshold=min_score,
+            score_threshold=_REGEX_MIN_SCORE - 0.05,  # fetch wide, filter tight
         )
     except Exception as exc:
         log.error("Presidio analysis failed: %s", exc)
         return []
 
-    from .false_positive_filter import PresidioHit, suppress_false_positives
+    # Per-entity-type score filtering
+    filtered_raw = []
+    for r in raw_results:
+        if r.entity_type in _NER_ENTITIES:
+            threshold = _NER_MIN_SCORE + bump
+        else:
+            threshold = _REGEX_MIN_SCORE + bump
+        if r.score >= threshold:
+            filtered_raw.append(r)
 
+    # Wrap for FP suppression
     hits = [
         PresidioHit(
             entity_type=r.entity_type,
@@ -165,10 +168,19 @@ def scan_pii(
             start=r.start,
             end=r.end,
         )
-        for r in raw_results
+        for r in filtered_raw
     ]
 
-    filtered = suppress_false_positives(hits, text, is_technical=is_technical, min_score=min_score)
+    filtered = suppress_false_positives(
+        hits, text, is_technical=is_technical, min_score=_REGEX_MIN_SCORE
+    )
+
+    # Deduplicate: if same span is matched by multiple entity types, keep highest score
+    seen: dict[tuple[int, int], PresidioHit] = {}
+    for h in filtered:
+        key = (h.start, h.end)
+        if key not in seen or h.score > seen[key].score:
+            seen[key] = h
 
     return [
         PIIMatch(
@@ -178,23 +190,22 @@ def scan_pii(
             start=h.start,
             end=h.end,
         )
-        for h in filtered
+        for h in seen.values()
     ]
 
 
 class PIIScanner:
-    """Stateless class wrapper around scan_pii for use in the pipeline."""
+    """Pipeline-compatible class wrapper around scan_pii."""
 
     def __init__(
         self,
         entities: list[str] | None = None,
-        min_score: float = 0.65,
+        min_score: float = _REGEX_MIN_SCORE,
     ) -> None:
         self._entities = entities
         self._min_score = min_score
 
     def scan(self, text: str, language: str | None = None) -> list[RuleHit]:
-        """Run PII scan and return RuleHit list compatible with pipeline."""
         matches = scan_pii(
             text,
             language=language,
