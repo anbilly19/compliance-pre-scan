@@ -1,5 +1,6 @@
 """Centralised settings loaded from environment / .env file."""
 from pathlib import Path
+from typing import Optional
 from pydantic import ConfigDict
 from pydantic_settings import BaseSettings
 
@@ -21,13 +22,14 @@ class Settings(BaseSettings):
     block_on_structural_anomaly: bool = True
 
     # ── Hit masking (Phase 11) ────────────────────────────────────────────────
-    # False (default) — full snippets stored and returned; useful for dev/test
-    # True            — snippets masked before DB write + API response; use in production
-    #
-    # PII:    keep first 2 + last 2 chars  e.g. 'max.mustermann@firma.de' → 'ma***de'
-    # SECRET: keep first 4 chars only      e.g. 'AKIAIOSFODNN7EXAMPLE'   → 'AKIA****'
-    # KEYWORD / ANOMALY: pass through unchanged
     mask_snippets: bool = False
+
+    # ── OPA / Rego policy engine (Phase 12) ───────────────────────────────────
+    # Leave empty (default) to use the inline Python fallback.
+    # Set to the OPA server base URL to use OPA for policy decisions.
+    # Example: OPA_URL=http://localhost:8181
+    opa_url: Optional[str] = None
+    opa_timeout_s: float = 2.0
 
     # Anomaly heuristics
     entropy_high_threshold: float = 7.2

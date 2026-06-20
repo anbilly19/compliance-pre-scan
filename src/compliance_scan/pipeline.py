@@ -9,6 +9,7 @@ from .audit.models import RuleHit, RiskLevel, Decision, ScanResult
 from .config import settings
 from .extractors import extract_text
 from .masking import mask_result
+from .policy.engine import PolicyInput, evaluate
 from .scanners import (
     identify_file,
     PIIScanner,
@@ -28,30 +29,36 @@ _anomaly = AnomalyScanner()
 def run_scan(path: Path, filename: str | None = None) -> ScanResult:
     """
     Full pre-upload scan pipeline.
-    1. Identify file type
-    2. Extract text
-    3. Run PII / secret / keyword / anomaly scanners
-    4. Derive risk level and decision (including BLOCK when thresholds exceeded)
-    5. Apply hit masking when mask_snippets=True
+    1.  Identify file type
+    2.  Extract text
+    3.  Run PII / secret / keyword / anomaly scanners
+    4.  Evaluate policy (OPA or inline fallback)
+    5.  Apply hit masking when mask_snippets=True
     """
     t0 = time.monotonic()
     fname = filename or path.name
-    log.info("run_scan START file=%r mask_snippets=%s", fname, settings.mask_snippets)
+    log.info(
+        "run_scan START file=%r mask=%s opa=%s",
+        fname, settings.mask_snippets, bool(settings.opa_url),
+    )
 
+    # Step 1
     identity = identify_file(path)
     log.debug(
         "file_identity mime_detected=%s mime_ext=%s mismatch=%s",
         identity.mime_detected, identity.mime_from_extension, identity.extension_mismatch,
     )
 
+    # Step 2
     extraction = extract_text(
         path,
         mime_type=identity.mime_detected
         if identity.mime_detected != "application/octet-stream"
         else None,
     )
-    log.debug("extraction chars=%d pages=%s", len(extraction.text), getattr(extraction, "page_count", "?"))
+    log.debug("extraction chars=%d", len(extraction.text))
 
+    # Step 3
     pii_hits     = _pii.scan(extraction.text)
     secret_hits  = _secret.scan(extraction.text)
     keyword_hits = _keyword.scan(extraction.text)
@@ -62,18 +69,36 @@ def run_scan(path: Path, filename: str | None = None) -> ScanResult:
         len(pii_hits), len(secret_hits), len(keyword_hits), len(anomaly_hits),
     )
 
-    result = _derive_decision(
+    # Step 4 — policy
+    high_anomalies = [h for h in anomaly_hits if h.severity == "HIGH"]
+    policy_inp = PolicyInput(
+        pii_count=len(pii_hits),
+        secret_count=len(secret_hits),
+        keyword_count=len(keyword_hits),
+        high_anomaly_count=len(high_anomalies),
+    )
+    policy_result = evaluate(policy_inp)
+    log.info(
+        "policy decision risk=%s decision=%s reason=%s backend=%s",
+        policy_result.risk_level, policy_result.decision,
+        policy_result.reason, "opa" if settings.opa_url else "inline",
+    )
+
+    result = ScanResult(
         filename=fname,
-        identity=identity,
-        pii_hits=pii_hits,
-        secret_hits=secret_hits,
-        keyword_hits=keyword_hits,
-        anomaly_hits=anomaly_hits,
+        file_type_detected=identity.mime_detected,
+        file_type_declared=identity.mime_from_extension,
+        extension_mismatch=identity.extension_mismatch,
+        risk_level=policy_result.risk_level,
+        decision=policy_result.decision,
+        pii_matches=pii_hits,
+        secret_matches=secret_hits,
+        keyword_matches=keyword_hits,
+        anomaly_matches=anomaly_hits,
     )
     result.scan_duration_ms = int((time.monotonic() - t0) * 1000)
 
-    # Step 5 — mask snippets before result leaves this function
-    # (masked values hit both the DB write and the API response)
+    # Step 5 — masking
     result = mask_result(result)
 
     log.info(
@@ -81,69 +106,3 @@ def run_scan(path: Path, filename: str | None = None) -> ScanResult:
         fname, result.risk_level, result.decision, result.scan_duration_ms,
     )
     return result
-
-
-def _derive_decision(
-    filename: str,
-    identity,
-    pii_hits: list[RuleHit],
-    secret_hits: list[RuleHit],
-    keyword_hits: list[RuleHit],
-    anomaly_hits: list[RuleHit],
-) -> ScanResult:
-    """Map scan hits to a RiskLevel + Decision according to configured thresholds."""
-    risk     = RiskLevel.CLEAN
-    decision = Decision.ALLOW
-
-    high_anomalies = [h for h in anomaly_hits if h.severity == "HIGH"]
-
-    if len(secret_hits) >= settings.secret_warn_threshold:
-        risk     = RiskLevel.SECRET_FOUND
-        decision = Decision.ALLOW_WITH_WARNING
-        log.warning("Policy: SECRET_FOUND (%d hits)", len(secret_hits))
-
-    if settings.block_on_secret > 0 and len(secret_hits) >= settings.block_on_secret:
-        risk     = RiskLevel.SECRET_FOUND
-        decision = Decision.BLOCK
-        log.warning("Policy: BLOCK on secret (%d hits)", len(secret_hits))
-
-    if len(pii_hits) >= settings.pii_warn_threshold:
-        if risk == RiskLevel.CLEAN:
-            risk = RiskLevel.SENSITIVE_PII
-        if decision == Decision.ALLOW:
-            decision = Decision.ALLOW_WITH_WARNING
-        log.warning("Policy: SENSITIVE_PII (%d hits)", len(pii_hits))
-
-    if settings.block_on_pii > 0 and len(pii_hits) >= settings.block_on_pii:
-        risk     = RiskLevel.SENSITIVE_PII
-        decision = Decision.BLOCK
-        log.warning("Policy: BLOCK on PII (%d hits)", len(pii_hits))
-
-    if keyword_hits and decision == Decision.ALLOW:
-        risk     = RiskLevel.SENSITIVE_PII
-        decision = Decision.ALLOW_WITH_WARNING
-        log.warning("Policy: KEYWORD match (%d hits)", len(keyword_hits))
-
-    if high_anomalies:
-        if decision != Decision.BLOCK:
-            risk     = RiskLevel.STRUCTURAL_ANOMALY
-            decision = Decision.ALLOW_WITH_WARNING
-        log.warning("Policy: STRUCTURAL_ANOMALY (%d high hits)", len(high_anomalies))
-
-    if settings.block_on_structural_anomaly and high_anomalies:
-        risk     = RiskLevel.STRUCTURAL_ANOMALY
-        decision = Decision.BLOCK
-        log.warning("Policy: BLOCK on structural anomaly (%d high hits)", len(high_anomalies))
-
-    return ScanResult(
-        filename=filename,
-        file_type_detected=identity.mime_detected,
-        file_type_declared=identity.mime_from_extension,
-        extension_mismatch=identity.extension_mismatch,
-        risk_level=risk,
-        decision=decision,
-        pii_matches=pii_hits,
-        secret_matches=secret_hits,
-        keyword_matches=keyword_hits,
-        anomaly_matches=anomaly_hits,
-    )
