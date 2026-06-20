@@ -1,21 +1,26 @@
-"""POST /scan endpoint."""
+"""POST /scan endpoint — pre-upload compliance scan."""
+import tempfile
 import time
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 
-from ..extractors import get_extractor
-from ..scanners.file_identity import check_file_identity
-from ..audit.models import ScanResult, RuleHit, RiskLevel, Decision
 from ..audit.db import write_event
+from ..audit.models import Decision, ScanResult
+from ..pipeline import run_scan
 
 router = APIRouter(tags=["scan"])
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".txt", ".rtf"}
 
+# HTTP 451 = "Unavailable For Legal Reasons" — used here to signal a compliance BLOCK.
+# The response body is always a full ScanResult JSON so the caller can log/display details.
+HTTP_BLOCKED = 451
 
-@router.post("/scan", response_model=ScanResult)
+
+@router.post("/scan")
 async def scan_file(
     file: UploadFile = File(...),
     user_id: str = Form(...),
@@ -23,11 +28,13 @@ async def scan_file(
 ):
     """
     Pre-upload compliance scan.
-    Accepts a file upload, runs all detection layers,
-    returns a ScanResult and writes an audit event.
+
+    Returns
+    -------
+    200  ScanResult   decision == ALLOW or ALLOW_WITH_WARNING
+    451  ScanResult   decision == BLOCK  (file must not be sent to LLM)
+    415  error        unsupported file type
     """
-    t_start = time.monotonic()
-    upload_id = str(uuid.uuid4())
     filename = file.filename or "unknown"
     ext = Path(filename).suffix.lower()
 
@@ -39,64 +46,30 @@ async def scan_file(
 
     data = await file.read()
 
-    # --- 1. File identity check ---
-    identity = check_file_identity(data, filename)
+    # Write to a temp file so the pipeline (which works with Path) can read it.
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = Path(tmp.name)
 
-    # --- 2. Text extraction ---
-    extractor = get_extractor(ext)
-    if extractor is None:
-        raise HTTPException(status_code=415, detail="No extractor available")
-    extraction = extractor.extract(data, filename)
+    try:
+        result: ScanResult = run_scan(tmp_path, filename=filename)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
-    # --- 3-6. Scanners (Phase 2 — stubs return empty lists for now) ---
-    pii_matches: list[RuleHit] = []
-    secret_matches: list[RuleHit] = []
-    keyword_matches: list[RuleHit] = []
-    anomaly_matches: list[RuleHit] = []
-
-    # Structural anomaly from file identity
-    if identity.extension_mismatch or identity.is_suspicious_type:
-        anomaly_matches.append(RuleHit(
-            scanner="ANOMALY",
-            rule_id="FILE_IDENTITY_MISMATCH",
-            entity_type="extension_mismatch" if identity.extension_mismatch else "suspicious_type",
-            severity="HIGH",
-            match_snippet=identity.note[:80],
-        ))
-
-    # --- 7. Policy decision (Phase 3 — simple inline rules for now) ---
-    from ..policy.engine import evaluate
-    risk_level, decision = evaluate(
-        pii_matches=pii_matches,
-        secret_matches=secret_matches,
-        anomaly_matches=anomaly_matches,
-        keyword_matches=keyword_matches,
-    )
-
-    scan_duration_ms = int((time.monotonic() - t_start) * 1000)
-
-    result = ScanResult(
-        upload_id=upload_id,
-        filename=filename,
-        file_type_detected=identity.detected_mime,
-        file_type_declared=identity.declared_mime,
-        extension_mismatch=identity.extension_mismatch,
-        risk_level=risk_level,
-        decision=decision,
-        pii_matches=pii_matches,
-        secret_matches=secret_matches,
-        keyword_matches=keyword_matches,
-        anomaly_matches=anomaly_matches,
-        scan_duration_ms=scan_duration_ms,
-    )
-
-    # --- 8. Write audit event ---
+    # Persist audit event
     await write_event(
-        upload_id=upload_id,
+        upload_id=result.upload_id,
         user_id=user_id,
         session_id=session_id,
         filename=filename,
         result=result,
     )
 
-    return result
+    result_dict = result.model_dump(mode="json")
+
+    if result.decision == Decision.BLOCK:
+        # Return 451 so the upstream chat layer / SDK can detect and hard-block the upload.
+        # The full ScanResult body lets the UI display exactly why it was blocked.
+        return JSONResponse(status_code=HTTP_BLOCKED, content=result_dict)
+
+    return JSONResponse(status_code=200, content=result_dict)
