@@ -43,6 +43,20 @@ No LLMs are used at any point. All processing is local and offline-capable.
 
 ---
 
+## Example scenarios
+
+Detailed examples live in separate markdown files:
+
+- [PII examples](docs/examples_pii.md)
+- [Secret and credential examples](docs/examples_secrets.md)
+- [Keyword and confidentiality examples](docs/examples_keywords.md)
+- [Anomaly and suspicious file examples](docs/examples_anomalies.md)
+- [Full decision walkthroughs](docs/examples_decision_walkthroughs.md)
+
+These documents show what gets flagged, when warnings are expected, and which document types should be suppressed or reduced.
+
+---
+
 ## Expected detections
 
 ### PII (via Microsoft Presidio — MIT)
@@ -148,57 +162,41 @@ Thresholds are configurable via `.env` / `config.py`.
 
 ## Repository structure
 
-```
+```text
 compliance-pre-scan/
 ├── README.md
+├── docs/
+│   ├── examples_pii.md
+│   ├── examples_secrets.md
+│   ├── examples_keywords.md
+│   ├── examples_anomalies.md
+│   └── examples_decision_walkthroughs.md
 ├── pyproject.toml
 ├── .env.example
 ├── debug_scan.py               # CLI: scan a single file, full debug output
 │
 ├── config/
-│   └── keywords/               # YAML keyword lists per domain
+│   └── keywords/
 │       ├── confidentiality.yaml
 │       ├── hr.yaml
 │       └── finance.yaml
 │
 ├── logs/
-│   └── compliance_scan.log     # rotating log, created on first import
+│   └── compliance_scan.log
 │
 ├── src/
 │   └── compliance_scan/
-│       ├── __init__.py         # imports logging_setup — log file guaranteed on any entry point
-│       ├── logging_setup.py    # rotating file + console handler, auto-configures on import
-│       ├── config.py           # settings from .env
-│       ├── pipeline.py         # orchestrates all scanners → ScanResult
-│       │
+│       ├── __init__.py
+│       ├── logging_setup.py
+│       ├── config.py
+│       ├── pipeline.py
 │       ├── extractors/
-│       │   ├── pdf.py
-│       │   ├── docx.py
-│       │   ├── xlsx.py
-│       │   ├── txt.py
-│       │   └── rtf.py
-│       │
 │       ├── scanners/
-│       │   ├── file_identity.py
-│       │   ├── pii_scanner.py
-│       │   ├── secret_scanner.py
-│       │   ├── keyword_scanner.py
-│       │   ├── anomaly_scanner.py
-│       │   ├── false_positive_filter.py  # doc classifier + suppression lists
-│       │   └── language_detect.py
-│       │
 │       ├── audit/
-│       │   ├── db.py           # SQLite schema + aiosqlite helpers
-│       │   ├── models.py       # Pydantic: ScanResult, RuleHit, AuditEvent
-│       │   └── export.py       # CSV for Betriebsrat
-│       │
 │       └── api/
-│           ├── app.py          # FastAPI app + lifespan
-│           ├── scan.py         # POST /scan
-│           └── compliance.py   # GET /events, GET /events/export
 │
 ├── ui/
-│   └── app.py                  # Streamlit dashboard
+│   └── app.py
 │
 └── tests/
     ├── test_extractors.py
