@@ -18,7 +18,7 @@
 | 7 | False-positive suppression (technical + financial docs) | ✅ Done |
 | 8 | ClamAV / YARA integration | ⬜ Planned |
 | 9 | Manual breach report UI + `POST /compliance/breach-report` | ✅ Done |
-| 10 | BLOCK enforcement in chat layer | ⬜ Planned |
+| 10 | BLOCK enforcement — HTTP 451, config flags, wired pipeline, tests | ✅ Done |
 | 11 | Hit masking config flag (test vs production) | ⬜ Planned |
 | 12 | OPA/Rego policy externalisation | ⬜ Planned |
 
@@ -35,7 +35,7 @@ When a user selects a file for upload in the chat platform, this service interce
 5. **Custom keyword matching** — organisation-specific terms: project names, internal IDs, confidentiality markers
 6. **Structural anomaly heuristics** — entropy, size-vs-text ratio, extension mismatch, embedded macros/OLE objects
 7. **False-positive suppression** — technical procurement docs and financial cost sheets are classified and irrelevant NER hits (ORG/LOC fragments) are dropped automatically
-8. **Policy decision** — maps scan results to a risk level and decision (ALLOW / ALLOW_WITH_WARNING / BLOCK)
+8. **Policy decision** — maps scan results to a risk level and decision (`ALLOW` / `ALLOW_WITH_WARNING` / `BLOCK`)
 9. **Audit event log** — every scan and manual breach report is appended as an immutable SQLite row
 10. **Betriebsrat CSV export** — date-range filtered export for works council / internal audit
 
@@ -63,7 +63,7 @@ Detailed examples and suppression logic live in the `docs/` folder:
 ### PII (via Microsoft Presidio — MIT)
 
 | Entity | Examples | Severity | Languages |
-|--------|----------|----------|-----------| 
+|--------|----------|----------|-----------|
 | `EMAIL_ADDRESS` | `max.mustermann@firma.de` | HIGH | EN + DE |
 | `PHONE_NUMBER` | `+49 211 1234567` | HIGH | EN + DE |
 | `IBAN_CODE` | `DE89 3704 0044 0532 0130 00` | HIGH | EN + DE |
@@ -120,16 +120,20 @@ Keyword lists live in `config/keywords/`. Add domain-specific terms per file:
 
 ## Policy decisions
 
-| Condition | Risk level | Decision |
-|-----------|------------|----------|
-| No hits | `CLEAN` | `ALLOW` |
-| PII hits ≥ threshold (default: 1) | `SENSITIVE_PII` | `ALLOW_WITH_WARNING` |
-| Any secret hit | `SECRET_FOUND` | `ALLOW_WITH_WARNING` |
-| Any keyword hit | `SENSITIVE_PII` | `ALLOW_WITH_WARNING` |
-| High anomaly (e.g. extension mismatch, entropy spike) | `STRUCTURAL_ANOMALY` | `ALLOW_WITH_WARNING` |
-| *(BLOCK path wired, activatable via threshold config)* | any | `BLOCK` |
+| Condition | Risk level | Decision | HTTP |
+|-----------|------------|----------|------|
+| No hits | `CLEAN` | `ALLOW` | 200 |
+| PII hits ≥ `PII_WARN_THRESHOLD` | `SENSITIVE_PII` | `ALLOW_WITH_WARNING` | 200 |
+| PII hits ≥ `BLOCK_ON_PII` (if > 0) | `SENSITIVE_PII` | `BLOCK` | **451** |
+| Any secret hit ≥ `SECRET_WARN_THRESHOLD` | `SECRET_FOUND` | `ALLOW_WITH_WARNING` | 200 |
+| Secret hits ≥ `BLOCK_ON_SECRET` (default: 1) | `SECRET_FOUND` | `BLOCK` | **451** |
+| Any keyword hit | `SENSITIVE_PII` | `ALLOW_WITH_WARNING` | 200 |
+| HIGH anomaly (ext mismatch, entropy spike) | `STRUCTURAL_ANOMALY` | `ALLOW_WITH_WARNING` | 200 |
+| HIGH anomaly + `BLOCK_ON_STRUCTURAL_ANOMALY=true` | `STRUCTURAL_ANOMALY` | `BLOCK` | **451** |
 
-Thresholds are configurable via `.env` / `config.py`.
+All thresholds are configurable via `.env`. See `.env.example` for the full list.
+
+> **HTTP 451** is returned for all `BLOCK` decisions. The full `ScanResult` JSON is included in the response body so the upstream chat layer can display exactly why the upload was blocked.
 
 ---
 
@@ -175,7 +179,7 @@ compliance-pre-scan/
 │   └── false_positive_suppression.md
 ├── pyproject.toml
 ├── .env.example
-├── debug_scan.py               # CLI: scan a single file, full debug output
+├── debug_scan.py
 │
 ├── config/
 │   └── keywords/
@@ -183,13 +187,8 @@ compliance-pre-scan/
 │       ├── hr.yaml
 │       └── finance.yaml
 │
-├── logs/
-│   └── compliance_scan.log
-│
 ├── src/
 │   └── compliance_scan/
-│       ├── __init__.py
-│       ├── logging_setup.py
 │       ├── config.py
 │       ├── pipeline.py
 │       ├── extractors/
@@ -203,7 +202,7 @@ compliance-pre-scan/
 └── tests/
     ├── test_extractors.py
     ├── test_scanners.py
-    ├── test_policy.py
+    ├── test_block_enforcement.py
     └── fixtures/
 ```
 
@@ -222,8 +221,36 @@ uvicorn compliance_scan.api.app:app --reload
 # start UI (separate terminal)
 streamlit run ui/app.py
 
-# or scan a single file directly from CLI
+# scan a single file from CLI
 uv run python debug_scan.py path/to/file.pdf
+```
+
+---
+
+## Integrating BLOCK into your chat layer
+
+The scan endpoint returns **HTTP 451** for any `BLOCK` decision. Check the status code before forwarding the file to the LLM:
+
+```python
+resp = requests.post(
+    "http://compliance-scan/scan",
+    data={"user_id": user_id, "session_id": session_id},
+    files={"file": (filename, file_bytes, mime_type)},
+)
+
+if resp.status_code == 451:
+    result = resp.json()
+    raise UploadBlockedError(
+        risk=result["risk_level"],
+        decision=result["decision"],
+        hits=result["secret_matches"] + result["anomaly_matches"],
+    )
+
+if resp.status_code == 200 and resp.json()["decision"] == "ALLOW_WITH_WARNING":
+    show_warning_banner(resp.json())   # display to user, let them confirm
+
+# only reach here if ALLOW or user confirmed WARNING
+forward_to_llm(file_bytes)
 ```
 
 ---
@@ -240,31 +267,28 @@ CREATE TABLE compliance_events (
     filename         TEXT NOT NULL,
     action           TEXT NOT NULL,          -- PRE_SCAN_COMPLETED | MANUAL_BREACH_REPORT
     risk_level       TEXT NOT NULL,
-    decision         TEXT NOT NULL,
+    decision         TEXT NOT NULL,          -- ALLOW | ALLOW_WITH_WARNING | BLOCK
     pii_count        INTEGER DEFAULT 0,
     secret_count     INTEGER DEFAULT 0,
     keyword_count    INTEGER DEFAULT 0,
     anomaly_flags    TEXT DEFAULT '[]',
     scan_duration_ms INTEGER,
-    breach_reason    TEXT,                   -- only for MANUAL_BREACH_REPORT
-    breach_severity  TEXT,                   -- LOW | MEDIUM | HIGH | CRITICAL
-    breach_reporter  TEXT                    -- user or role who filed the report
+    breach_reason    TEXT,
+    breach_severity  TEXT,
+    breach_reporter  TEXT
 );
 ```
-
-Every automated scan writes one `PRE_SCAN_COMPLETED` row.  
-Manual breach reports write a `MANUAL_BREACH_REPORT` row via `POST /compliance/breach-report`.
 
 ---
 
 ## API endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/scan` | Pre-upload scan; returns `ScanResult` + writes audit event |
-| `GET` | `/compliance/events` | List audit events (filterable by user, date, action) |
-| `GET` | `/compliance/events/export` | Download events as CSV (Betriebsrat export) |
-| `POST` | `/compliance/breach-report` | Submit manual data breach / compliance concern report |
+| Method | Path | Status | Description |
+|--------|------|--------|-------------|
+| `POST` | `/scan` | 200 / 451 / 415 | Pre-upload scan; **451 = BLOCK** |
+| `GET` | `/compliance/events` | 200 | List audit events |
+| `GET` | `/compliance/events/export` | 200 | Betriebsrat CSV download |
+| `POST` | `/compliance/breach-report` | 201 | Manual breach report |
 
 ---
 
@@ -273,8 +297,8 @@ Manual breach reports write a `MANUAL_BREACH_REPORT` row via `POST /compliance/b
 | Column | Notes |
 |--------|-------|
 | `timestamp` | ISO 8601 |
-| `user_id` | Pseudonymised (SHA-256) or real ID for authorised exports |
-| `filename` | Stored as-is in current test mode |
+| `user_id` | Pseudonymised (SHA-256) or real ID |
+| `filename` | Stored as-is |
 | `action` | `PRE_SCAN_COMPLETED` or `MANUAL_BREACH_REPORT` |
 | `risk_level` | `CLEAN` / `SENSITIVE_PII` / `SECRET_FOUND` / `STRUCTURAL_ANOMALY` |
 | `decision` | `ALLOW` / `ALLOW_WITH_WARNING` / `BLOCK` |
@@ -284,19 +308,18 @@ Manual breach reports write a `MANUAL_BREACH_REPORT` row via `POST /compliance/b
 | `anomaly_flags` | JSON array |
 | `scan_duration_ms` | integer |
 | `breach_reason` | free-text (manual reports only) |
-| `breach_severity` | LOW / MEDIUM / HIGH / CRITICAL (manual reports only) |
-| `breach_reporter` | name or role (manual reports only) |
+| `breach_severity` | LOW / MEDIUM / HIGH / CRITICAL |
+| `breach_reporter` | name or role |
 
-Raw file content is **never** included in the export.
+Raw file content is **never** included.
 
 ---
 
 ## Planned (next sprints)
 
-- **BLOCK enforcement** — hard-block at chat layer when backend returns `BLOCK`; currently wired but not enforced
-- **Hit masking config flag** — `MASK_SNIPPETS=true` for production; currently off for testing
-- **ClamAV integration** — optional sidecar for known-malware signature scanning
-- **OPA/Rego** — externalise policy rules out of `pipeline.py`
+- **Phase 11 — Hit masking** — `MASK_SNIPPETS=true` env flag for production; snippets currently unmasked for dev/test
+- **Phase 12 — OPA/Rego** — externalise policy rules out of `pipeline.py` so rules can change without a code deploy
+- **ClamAV sidecar** — optional clamd integration for known-malware signature scanning on raw bytes
 
 ---
 
