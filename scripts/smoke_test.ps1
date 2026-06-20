@@ -2,10 +2,10 @@
 .SYNOPSIS
     Smoke-tests the compliance-pre-scan API against the running local server.
 .DESCRIPTION
-    Creates synthetic test files in a temp directory, POSTs each to /scan,
-    checks the expected HTTP status code and decision field, then fetches
-    the audit trail and exports a Betriebsrat CSV.
-    Requires PowerShell 7+ and a running server on $BaseUrl.
+    Creates synthetic test files in a temp directory, uploads each to /scan
+    via curl.exe (bundled with Windows 10/11), checks the expected HTTP
+    status code and decision field, then fetches the audit trail and exports
+    a Betriebsrat CSV.
 .PARAMETER BaseUrl
     Base URL of the server. Default: http://localhost:8000
 .PARAMETER UserId
@@ -30,21 +30,23 @@ function Info($msg) { Write-Host "  [INFO] $msg" -ForegroundColor Cyan }
 function Head($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Yellow }
 
 # ----------------------------------------------------------------
+# verify curl.exe is available
+# ----------------------------------------------------------------
+if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+    Write-Host "curl.exe not found. Install it or add C:\Windows\System32 to PATH." -ForegroundColor Red
+    exit 1
+}
+
+# ----------------------------------------------------------------
 # check server is up
 # ----------------------------------------------------------------
 Head "Checking server at $BaseUrl"
-try {
-    $null = Invoke-WebRequest "$BaseUrl/docs" -Method Get -ErrorAction Stop
-    Info "Server is reachable"
-} catch {
-    $code = $_.Exception.Response.StatusCode.value__
-    if ($null -ne $code -and [int]$code -lt 500) {
-        Info "Server reachable (got $code)"
-    } else {
-        Fail "Cannot reach $BaseUrl -- is the server running?"
-        exit 1
-    }
+$pingStatus = curl.exe -s -o NUL -w "%{http_code}" "$BaseUrl/docs"
+if ($pingStatus -eq "000") {
+    Fail "Cannot reach $BaseUrl -- is the server running?"
+    exit 1
 }
+Info "Server reachable (HTTP $pingStatus)"
 
 # ----------------------------------------------------------------
 # temp directory
@@ -57,49 +59,46 @@ $PassCount = 0
 $FailCount = 0
 
 # ----------------------------------------------------------------
-# Invoke-Scan: POST a file to /scan using -Form (PS7 native multipart)
-# Returns hashtable: { Status = int; Body = PSObject }
+# Invoke-Scan
+#   Shells out to curl.exe for reliable multipart upload.
+#   Returns hashtable: { Status = int; Body = PSObject }
 # ----------------------------------------------------------------
 function Invoke-Scan {
     param(
         [string]$FilePath,
         [string]$FileName = ""
     )
-    if (-not $FileName) { $FileName = Split-Path $FilePath -Leaf }
 
-    $form = @{
-        user_id    = $UserId
-        session_id = "smoke-session"
-        file       = Get-Item $FilePath
+    # If a different FileName is requested, copy to a temp path with that name
+    # so curl sends the correct filename in the Content-Disposition header.
+    $uploadPath = $FilePath
+    if ($FileName -and $FileName -ne (Split-Path $FilePath -Leaf)) {
+        $uploadPath = Join-Path (Split-Path $FilePath) $FileName
+        Copy-Item $FilePath $uploadPath -Force
     }
 
-    # Rename the FileInfo name seen by the server if FileName differs from actual name
-    # by copying to a temp path with the desired name.
-    if ($FileName -ne (Split-Path $FilePath -Leaf)) {
-        $renamed = Join-Path (Split-Path $FilePath) $FileName
-        Copy-Item $FilePath $renamed -Force
-        $form.file = Get-Item $renamed
-    }
+    $bodyFile   = Join-Path $TmpDir ("resp_" + [System.IO.Path]::GetRandomFileName() + ".json")
 
-    try {
-        $resp = Invoke-RestMethod `
-            -Uri "$BaseUrl/scan" `
-            -Method Post `
-            -Form $form `
-            -StatusCodeVariable sc `
-            -ErrorAction Stop
-        return @{ Status = [int]$sc; Body = $resp }
-    } catch {
-        $status = [int]$_.Exception.Response.StatusCode.value__
-        $raw    = $_.ErrorDetails.Message
-        try   { $parsed = $raw | ConvertFrom-Json }
-        catch { $parsed = [PSCustomObject]@{ detail = $raw } }
-        return @{ Status = $status; Body = $parsed }
-    }
+    $status = curl.exe `
+        -s `
+        -o $bodyFile `
+        -w "%{http_code}" `
+        -X POST "$BaseUrl/scan" `
+        -F "user_id=$UserId" `
+        -F "session_id=smoke-session" `
+        -F "file=@$uploadPath"
+
+    $raw = ""
+    if (Test-Path $bodyFile) { $raw = Get-Content $bodyFile -Raw }
+
+    try   { $parsed = $raw | ConvertFrom-Json }
+    catch { $parsed = [PSCustomObject]@{ detail = $raw } }
+
+    return @{ Status = [int]$status; Body = $parsed }
 }
 
 # ----------------------------------------------------------------
-# Assert-Scan: run one scenario, print PASS/FAIL + hit summary
+# Assert-Scan
 # ----------------------------------------------------------------
 function Assert-Scan {
     param(
@@ -143,6 +142,7 @@ if ($r.Status -eq 200 -and $r.Body.decision -in @("ALLOW", "ALLOW_WITH_WARNING")
     $PassCount++
 } else {
     Fail ("Clean file  ->  got HTTP " + $r.Status + "  decision=" + $r.Body.decision)
+    if ($r.Body.detail) { Info ("    detail: " + $r.Body.detail) }
     $FailCount++
 }
 
@@ -151,7 +151,7 @@ if ($r.Status -eq 200 -and $r.Body.decision -in @("ALLOW", "ALLOW_WITH_WARNING")
 # ================================================================
 Head "Scenario 2 -- File with AWS key (expect 451 BLOCK)"
 $f = Join-Path $TmpDir "secrets.txt"
-Set-Content $f "Config dump:`nAWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE`nAWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+Set-Content -Encoding utf8 $f "Config dump:`nAWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE`nAWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 Assert-Scan -Label "AWS key file" -FilePath $f -ExpectedStatus 451 -ExpectedDecision "BLOCK"
 
 # ================================================================
@@ -166,7 +166,7 @@ Tel: +49 30 12345678
 E-Mail: max.mustermann@example.de
 Geburtsdatum: 01.01.1985
 IBAN: DE89 3704 0044 0532 0130 00
-"@ | Set-Content $f
+"@ | Set-Content -Encoding utf8 $f
 Assert-Scan -Label "CV PII file" -FilePath $f -ExpectedStatus 200 -ExpectedDecision "ALLOW_WITH_WARNING"
 
 # ================================================================
@@ -174,7 +174,7 @@ Assert-Scan -Label "CV PII file" -FilePath $f -ExpectedStatus 200 -ExpectedDecis
 # ================================================================
 Head "Scenario 4 -- Betriebsrat keywords (expect 200 ALLOW_WITH_WARNING)"
 $f = Join-Path $TmpDir "betriebsrat.txt"
-Set-Content $f "Betreff: Betriebsrat-Sitzung - Personalakte Mitarbeiter XY - Abmahnung und Kuendigung."
+Set-Content -Encoding utf8 $f "Betreff: Betriebsrat-Sitzung - Personalakte Mitarbeiter XY - Abmahnung und Kuendigung."
 Assert-Scan -Label "Betriebsrat memo" -FilePath $f -ExpectedStatus 200 -ExpectedDecision "ALLOW_WITH_WARNING"
 
 # ================================================================
@@ -182,7 +182,7 @@ Assert-Scan -Label "Betriebsrat memo" -FilePath $f -ExpectedStatus 200 -Expected
 # ================================================================
 Head "Scenario 5 -- JWT token (expect 451 BLOCK)"
 $f = Join-Path $TmpDir "jwt.txt"
-Set-Content $f "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyMTIzIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+Set-Content -Encoding utf8 $f "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyMTIzIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
 Assert-Scan -Label "JWT token" -FilePath $f -ExpectedStatus 451 -ExpectedDecision "BLOCK"
 
 # ================================================================
@@ -206,6 +206,7 @@ if ($r.Status -eq 415) {
     $PassCount++
 } else {
     Fail ("Unsupported type  ->  got HTTP " + $r.Status + "  (expected 415)")
+    if ($r.Body.detail) { Info ("    detail: " + $r.Body.detail) }
     $FailCount++
 }
 
@@ -252,7 +253,7 @@ try {
 Head "Betriebsrat CSV export"
 $csvPath = Join-Path $TmpDir "audit_export.csv"
 try {
-    Invoke-WebRequest "$BaseUrl/events/export" -OutFile $csvPath -ErrorAction Stop
+    $null = curl.exe -s -o $csvPath -w "%{http_code}" "$BaseUrl/events/export"
     $lineCount = (Get-Content $csvPath).Count
     Pass ("CSV saved to " + $csvPath + "  (" + $lineCount + " lines)")
 } catch {
