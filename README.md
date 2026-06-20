@@ -43,17 +43,18 @@ No LLMs are used at any point. All processing is local and offline-capable.
 
 ---
 
-## Example scenarios
+## Example scenarios and detection reference
 
-Detailed examples live in separate markdown files:
+Detailed examples and suppression logic live in the `docs/` folder:
 
-- [PII examples](docs/examples_pii.md)
-- [Secret and credential examples](docs/examples_secrets.md)
-- [Keyword and confidentiality examples](docs/examples_keywords.md)
-- [Anomaly and suspicious file examples](docs/examples_anomalies.md)
-- [Full decision walkthroughs](docs/examples_decision_walkthroughs.md)
-
-These documents show what gets flagged, when warnings are expected, and which document types should be suppressed or reduced.
+| Document | What it covers |
+|----------|---------------|
+| [PII examples](docs/examples_pii.md) | What personal data triggers warnings; which document types reduce noise |
+| [Secret and credential examples](docs/examples_secrets.md) | API keys, DB URIs, JWTs, PEM keys; placeholder tuning notes |
+| [Keyword and confidentiality examples](docs/examples_keywords.md) | Betriebsrat, HR, finance, legal keyword triggers; tuning weak signals |
+| [Anomaly and suspicious file examples](docs/examples_anomalies.md) | Extension mismatch, macros, entropy, size ratio, archive bombs |
+| [Full decision walkthroughs](docs/examples_decision_walkthroughs.md) | End-to-end scenarios tying multiple scanners together |
+| [False-positive suppression explained](docs/false_positive_suppression.md) | What gets suppressed, which classifiers trigger suppression, confidence thresholds, what is never suppressed, audit transparency, tuning guidance |
 
 ---
 
@@ -73,7 +74,7 @@ These documents show what gets flagged, when warnings are expected, and which do
 | `IP_ADDRESS` | `192.168.1.1` | LOW | EN + DE |
 | `DATE_TIME` | Dates in personal context | LOW | EN + DE |
 
-> **False-positive suppression:** Documents classified as financial cost sheets (Kostenkalkulation, Std. Satz, GESAMT-Kosten, etc.) or technical procurement documents (Ausschreibung, Leistungsumfang, DIN EN, etc.) have `ORGANIZATION` and `LOCATION` hits suppressed automatically. NER confidence thresholds are also raised by 0.05 on these document types.
+> **False-positive suppression:** Documents classified as financial cost sheets (Kostenkalkulation, Std. Satz, GESAMT-Kosten, etc.) or technical procurement documents (Ausschreibung, Leistungsumfang, DIN EN, etc.) have `ORGANIZATION` and `LOCATION` hits suppressed automatically. NER confidence thresholds are also raised by 0.05 on these document types. See [false_positive_suppression.md](docs/false_positive_suppression.md) for full details.
 
 ---
 
@@ -170,7 +171,8 @@ compliance-pre-scan/
 │   ├── examples_secrets.md
 │   ├── examples_keywords.md
 │   ├── examples_anomalies.md
-│   └── examples_decision_walkthroughs.md
+│   ├── examples_decision_walkthroughs.md
+│   └── false_positive_suppression.md
 ├── pyproject.toml
 ├── .env.example
 ├── debug_scan.py               # CLI: scan a single file, full debug output
