@@ -16,11 +16,10 @@
 | 5 | FastAPI endpoints + Streamlit UI | ✅ Done |
 | 6 | Logging (rotating file + console) | ✅ Done |
 | 7 | False-positive suppression (technical + financial docs) | ✅ Done |
-| 8 | ClamAV / YARA integration | ⬜ Planned |
 | 9 | Manual breach report UI + `POST /compliance/breach-report` | ✅ Done |
 | 10 | BLOCK enforcement — HTTP 451, config flags, wired pipeline, tests | ✅ Done |
 | 11 | Hit masking — `MASK_SNIPPETS` flag, `masking.py`, applied in pipeline, tests | ✅ Done |
-| 12 | OPA/Rego policy externalisation | ⬜ Planned |
+| 12 | OPA/Rego policy externalisation — `policy/engine.py`, `compliance.rego`, inline fallback, tests | ✅ Done |
 
 ---
 
@@ -28,14 +27,14 @@
 
 When a user selects a file for upload in the chat platform, this service intercepts it **before** it reaches the LLM agent and runs a multi-layer scan:
 
-1. **File identity check** — validates MIME type vs. declared extension (catches disguised payloads, e.g. an `.exe` renamed to `.pdf`)
+1. **File identity check** — validates MIME type vs. declared extension (catches disguised payloads)
 2. **Text extraction** — pulls raw text from PDF, DOCX, XLSX, TXT, RTF
 3. **PII detection** — finds personal identifiers using Microsoft Presidio with bilingual EN + DE NER and regex recognisers
-4. **Secret / credential scanning** — detects API keys, tokens, DB connection strings, passwords via Gitleaks-inspired regex ruleset
+4. **Secret / credential scanning** — detects API keys, tokens, DB connection strings, passwords
 5. **Custom keyword matching** — organisation-specific terms: project names, internal IDs, confidentiality markers
 6. **Structural anomaly heuristics** — entropy, size-vs-text ratio, extension mismatch, embedded macros/OLE objects
-7. **False-positive suppression** — technical procurement docs and financial cost sheets are classified; irrelevant NER hits (ORG/LOC) dropped automatically
-8. **Policy decision** — maps scan results to a risk level and decision (`ALLOW` / `ALLOW_WITH_WARNING` / `BLOCK`)
+7. **False-positive suppression** — technical procurement docs and financial cost sheets suppress irrelevant NER hits automatically
+8. **Policy decision** — maps scan results to a risk level and decision via OPA/Rego or inline Python fallback
 9. **Hit masking** — when `MASK_SNIPPETS=true`, sensitive snippets are masked before DB write and API response
 10. **Audit event log** — every scan and manual breach report is appended as an immutable SQLite row
 11. **Betriebsrat CSV export** — date-range filtered export for works council / internal audit
@@ -113,11 +112,34 @@ Controlled by `MASK_SNIPPETS` in `.env` (default: `false`).
 | `KEYWORD` | Pass through unchanged | `CONFIDENTIAL` → `CONFIDENTIAL` |
 | `ANOMALY` | Pass through unchanged | `extension_mismatch: pdf vs exe` → unchanged |
 
-Masking is applied in `pipeline.run_scan()` **before** the result is returned, so masked values are what gets written to the audit DB and returned by the API. Set `MASK_SNIPPETS=true` in production.
+Set `MASK_SNIPPETS=true` in production. Masking is applied before DB write and API response.
 
 ---
 
-## Policy decisions
+## Policy engine (OPA / Rego)
+
+Policy logic lives in `config/policy/compliance.rego` and is evaluated by the `policy/engine.py` module.
+
+**Two modes — same behaviour:**
+
+| Mode | When active | How to switch |
+|------|-------------|---------------|
+| Inline Python fallback | `OPA_URL` not set (default) | No setup needed |
+| OPA / Rego | `OPA_URL=http://localhost:8181` | Run OPA server pointing at `config/policy/` |
+
+The inline fallback is an exact Python mirror of the Rego rules, so you can develop and test without OPA installed. Set `OPA_URL` in production to decouple policy changes from deployments.
+
+**Run OPA locally:**
+
+```bash
+# single binary, Apache-2.0 licensed
+opa run --server config/policy/
+
+# then in .env:
+OPA_URL=http://localhost:8181
+```
+
+**Policy priority: BLOCK > ALLOW\_WITH\_WARNING > ALLOW**
 
 | Condition | Risk level | Decision | HTTP |
 |-----------|------------|----------|------|
@@ -156,7 +178,7 @@ Masking is applied in `pipeline.run_scan()` **before** the result is returned, s
 | Secret scanning | Custom regex (Gitleaks-inspired, written from scratch) | MIT |
 | Audit storage | SQLite via `aiosqlite` | MIT |
 | Language detection | `langdetect` | Apache-2.0 |
-| Policy engine | Inline Python (OPA/Rego planned) | — |
+| Policy engine | Inline Python + optional [OPA](https://www.openpolicyagent.org/) / Rego | Apache-2.0 |
 
 ---
 
@@ -169,11 +191,17 @@ compliance-pre-scan/
 ├── pyproject.toml
 ├── .env.example
 ├── debug_scan.py
-├── config/keywords/
+├── config/
+│   ├── keywords/
+│   └── policy/
+│       └── compliance.rego     ← Phase 12
 └── src/compliance_scan/
     ├── config.py
     ├── pipeline.py
-    ├── masking.py          ← Phase 11
+    ├── masking.py              ← Phase 11
+    ├── policy/                 ← Phase 12
+    │   ├── __init__.py
+    │   └── engine.py
     ├── extractors/
     ├── scanners/
     ├── audit/
@@ -183,7 +211,8 @@ tests/
 ├── test_extractors.py
 ├── test_scanners.py
 ├── test_block_enforcement.py
-├── test_masking.py             ← Phase 11
+├── test_masking.py
+├── test_policy_engine.py       ← Phase 12
 └── fixtures/
 ```
 
@@ -256,13 +285,6 @@ CREATE TABLE compliance_events (
 | `GET` | `/compliance/events` | 200 | List audit events |
 | `GET` | `/compliance/events/export` | 200 | Betriebsrat CSV download |
 | `POST` | `/compliance/breach-report` | 201 | Manual breach report |
-
----
-
-## Planned (next sprints)
-
-- **Phase 12 — OPA/Rego** — externalise policy rules out of `pipeline.py` so compliance logic can change without a code deploy
-- **ClamAV sidecar** — optional clamd integration for known-malware signature scanning on raw bytes
 
 ---
 
