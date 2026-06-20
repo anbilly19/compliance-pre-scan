@@ -19,7 +19,7 @@
 | 8 | ClamAV / YARA integration | ⬜ Planned |
 | 9 | Manual breach report UI + `POST /compliance/breach-report` | ✅ Done |
 | 10 | BLOCK enforcement — HTTP 451, config flags, wired pipeline, tests | ✅ Done |
-| 11 | Hit masking config flag (test vs production) | ⬜ Planned |
+| 11 | Hit masking — `MASK_SNIPPETS` flag, `masking.py`, applied in pipeline, tests | ✅ Done |
 | 12 | OPA/Rego policy externalisation | ⬜ Planned |
 
 ---
@@ -34,10 +34,11 @@ When a user selects a file for upload in the chat platform, this service interce
 4. **Secret / credential scanning** — detects API keys, tokens, DB connection strings, passwords via Gitleaks-inspired regex ruleset
 5. **Custom keyword matching** — organisation-specific terms: project names, internal IDs, confidentiality markers
 6. **Structural anomaly heuristics** — entropy, size-vs-text ratio, extension mismatch, embedded macros/OLE objects
-7. **False-positive suppression** — technical procurement docs and financial cost sheets are classified and irrelevant NER hits (ORG/LOC fragments) are dropped automatically
+7. **False-positive suppression** — technical procurement docs and financial cost sheets are classified; irrelevant NER hits (ORG/LOC) dropped automatically
 8. **Policy decision** — maps scan results to a risk level and decision (`ALLOW` / `ALLOW_WITH_WARNING` / `BLOCK`)
-9. **Audit event log** — every scan and manual breach report is appended as an immutable SQLite row
-10. **Betriebsrat CSV export** — date-range filtered export for works council / internal audit
+9. **Hit masking** — when `MASK_SNIPPETS=true`, sensitive snippets are masked before DB write and API response
+10. **Audit event log** — every scan and manual breach report is appended as an immutable SQLite row
+11. **Betriebsrat CSV export** — date-range filtered export for works council / internal audit
 
 No LLMs are used at any point. All processing is local and offline-capable.
 
@@ -45,16 +46,14 @@ No LLMs are used at any point. All processing is local and offline-capable.
 
 ## Example scenarios and detection reference
 
-Detailed examples and suppression logic live in the `docs/` folder:
-
 | Document | What it covers |
 |----------|---------------|
 | [PII examples](docs/examples_pii.md) | What personal data triggers warnings; which document types reduce noise |
 | [Secret and credential examples](docs/examples_secrets.md) | API keys, DB URIs, JWTs, PEM keys; placeholder tuning notes |
-| [Keyword and confidentiality examples](docs/examples_keywords.md) | Betriebsrat, HR, finance, legal keyword triggers; tuning weak signals |
+| [Keyword and confidentiality examples](docs/examples_keywords.md) | Betriebsrat, HR, finance, legal keyword triggers |
 | [Anomaly and suspicious file examples](docs/examples_anomalies.md) | Extension mismatch, macros, entropy, size ratio, archive bombs |
 | [Full decision walkthroughs](docs/examples_decision_walkthroughs.md) | End-to-end scenarios tying multiple scanners together |
-| [False-positive suppression explained](docs/false_positive_suppression.md) | What gets suppressed, which classifiers trigger suppression, confidence thresholds, what is never suppressed, audit transparency, tuning guidance |
+| [False-positive suppression explained](docs/false_positive_suppression.md) | What gets suppressed, confidence thresholds, tuning guidance |
 
 ---
 
@@ -74,8 +73,6 @@ Detailed examples and suppression logic live in the `docs/` folder:
 | `IP_ADDRESS` | `192.168.1.1` | LOW | EN + DE |
 | `DATE_TIME` | Dates in personal context | LOW | EN + DE |
 
-> **False-positive suppression:** Documents classified as financial cost sheets (Kostenkalkulation, Std. Satz, GESAMT-Kosten, etc.) or technical procurement documents (Ausschreibung, Leistungsumfang, DIN EN, etc.) have `ORGANIZATION` and `LOCATION` hits suppressed automatically. NER confidence thresholds are also raised by 0.05 on these document types. See [false_positive_suppression.md](docs/false_positive_suppression.md) for full details.
-
 ---
 
 ### Secrets / Credentials (regex ruleset, Gitleaks-inspired)
@@ -93,28 +90,30 @@ Detailed examples and suppression logic live in the `docs/` folder:
 
 ---
 
-### Keywords (configurable YAML lists)
-
-Keyword lists live in `config/keywords/`. Add domain-specific terms per file:
-
-| List | Sample triggers |
-|------|----------------|
-| `confidentiality.yaml` | Geheimhaltungsvereinbarung, NDA, vertraulich, confidential, internal only |
-| `hr.yaml` | Betriebsrat, Personalakte, Gehalt, Lohnabrechnung, Kündigung, Abmahnung |
-| `finance.yaml` | Jahresabschluss, Bilanz, Gewinn und Verlust, Steuerprüfung, IBAN, Kontonummer |
-| `legal.yaml` | EVB-IT, Vergaberecht, VOB, Rechtsstreit, Klage, Vergleich |
-
----
-
 ### Structural anomalies
 
 | Check | Trigger condition | Severity |
 |-------|-------------------|----------|
-| Extension mismatch | MIME magic ≠ declared extension (e.g. `.pdf` but binary is EXE) | HIGH |
-| High entropy | Shannon entropy > threshold on raw file chunks (likely encrypted/compressed payload) | MEDIUM |
-| Size vs text ratio | File size >> extracted text length for the file type (hidden binary content) | MEDIUM |
+| Extension mismatch | MIME magic ≠ declared extension | HIGH |
+| High entropy | Shannon entropy > threshold (likely encrypted/compressed payload) | MEDIUM |
+| Size vs text ratio | File size >> extracted text length (hidden binary content) | MEDIUM |
 | Embedded macro | DOCX/XLSX contains VBA macros or OLE objects | MEDIUM |
 | Archive bomb | ZIP recursion depth or unpacked size exceeds limits | HIGH |
+
+---
+
+## Hit masking
+
+Controlled by `MASK_SNIPPETS` in `.env` (default: `false`).
+
+| Scanner | Masking rule | Example |
+|---------|-------------|----------|
+| `PII` | Keep first 2 + last 2 chars | `max.mustermann@firma.de` → `ma***de` |
+| `SECRET` | Keep first 4 chars only | `AKIAIOSFODNN7EXAMPLE` → `AKIA****` |
+| `KEYWORD` | Pass through unchanged | `CONFIDENTIAL` → `CONFIDENTIAL` |
+| `ANOMALY` | Pass through unchanged | `extension_mismatch: pdf vs exe` → unchanged |
+
+Masking is applied in `pipeline.run_scan()` **before** the result is returned, so masked values are what gets written to the audit DB and returned by the API. Set `MASK_SNIPPETS=true` in production.
 
 ---
 
@@ -125,15 +124,11 @@ Keyword lists live in `config/keywords/`. Add domain-specific terms per file:
 | No hits | `CLEAN` | `ALLOW` | 200 |
 | PII hits ≥ `PII_WARN_THRESHOLD` | `SENSITIVE_PII` | `ALLOW_WITH_WARNING` | 200 |
 | PII hits ≥ `BLOCK_ON_PII` (if > 0) | `SENSITIVE_PII` | `BLOCK` | **451** |
-| Any secret hit ≥ `SECRET_WARN_THRESHOLD` | `SECRET_FOUND` | `ALLOW_WITH_WARNING` | 200 |
+| Secret hits ≥ `SECRET_WARN_THRESHOLD` | `SECRET_FOUND` | `ALLOW_WITH_WARNING` | 200 |
 | Secret hits ≥ `BLOCK_ON_SECRET` (default: 1) | `SECRET_FOUND` | `BLOCK` | **451** |
 | Any keyword hit | `SENSITIVE_PII` | `ALLOW_WITH_WARNING` | 200 |
-| HIGH anomaly (ext mismatch, entropy spike) | `STRUCTURAL_ANOMALY` | `ALLOW_WITH_WARNING` | 200 |
+| HIGH anomaly | `STRUCTURAL_ANOMALY` | `ALLOW_WITH_WARNING` | 200 |
 | HIGH anomaly + `BLOCK_ON_STRUCTURAL_ANOMALY=true` | `STRUCTURAL_ANOMALY` | `BLOCK` | **451** |
-
-All thresholds are configurable via `.env`. See `.env.example` for the full list.
-
-> **HTTP 451** is returned for all `BLOCK` decisions. The full `ScanResult` JSON is included in the response body so the upstream chat layer can display exactly why the upload was blocked.
 
 ---
 
@@ -171,39 +166,25 @@ All thresholds are configurable via `.env`. See `.env.example` for the full list
 compliance-pre-scan/
 ├── README.md
 ├── docs/
-│   ├── examples_pii.md
-│   ├── examples_secrets.md
-│   ├── examples_keywords.md
-│   ├── examples_anomalies.md
-│   ├── examples_decision_walkthroughs.md
-│   └── false_positive_suppression.md
 ├── pyproject.toml
 ├── .env.example
 ├── debug_scan.py
-│
-├── config/
-│   └── keywords/
-│       ├── confidentiality.yaml
-│       ├── hr.yaml
-│       └── finance.yaml
-│
-├── src/
-│   └── compliance_scan/
-│       ├── config.py
-│       ├── pipeline.py
-│       ├── extractors/
-│       ├── scanners/
-│       ├── audit/
-│       └── api/
-│
-├── ui/
-│   └── app.py
-│
-└── tests/
-    ├── test_extractors.py
-    ├── test_scanners.py
-    ├── test_block_enforcement.py
-    └── fixtures/
+├── config/keywords/
+└── src/compliance_scan/
+    ├── config.py
+    ├── pipeline.py
+    ├── masking.py          ← Phase 11
+    ├── extractors/
+    ├── scanners/
+    ├── audit/
+    └── api/
+
+tests/
+├── test_extractors.py
+├── test_scanners.py
+├── test_block_enforcement.py
+├── test_masking.py             ← Phase 11
+└── fixtures/
 ```
 
 ---
@@ -214,22 +195,13 @@ compliance-pre-scan/
 git clone https://github.com/anbilly19/compliance-pre-scan
 cd compliance-pre-scan
 uv sync
-
-# start backend
 uvicorn compliance_scan.api.app:app --reload
-
-# start UI (separate terminal)
 streamlit run ui/app.py
-
-# scan a single file from CLI
-uv run python debug_scan.py path/to/file.pdf
 ```
 
 ---
 
 ## Integrating BLOCK into your chat layer
-
-The scan endpoint returns **HTTP 451** for any `BLOCK` decision. Check the status code before forwarding the file to the LLM:
 
 ```python
 resp = requests.post(
@@ -240,16 +212,11 @@ resp = requests.post(
 
 if resp.status_code == 451:
     result = resp.json()
-    raise UploadBlockedError(
-        risk=result["risk_level"],
-        decision=result["decision"],
-        hits=result["secret_matches"] + result["anomaly_matches"],
-    )
+    raise UploadBlockedError(risk=result["risk_level"], hits=result["secret_matches"])
 
 if resp.status_code == 200 and resp.json()["decision"] == "ALLOW_WITH_WARNING":
-    show_warning_banner(resp.json())   # display to user, let them confirm
+    show_warning_banner(resp.json())
 
-# only reach here if ALLOW or user confirmed WARNING
 forward_to_llm(file_bytes)
 ```
 
@@ -265,9 +232,9 @@ CREATE TABLE compliance_events (
     session_id       TEXT,
     upload_id        TEXT NOT NULL,
     filename         TEXT NOT NULL,
-    action           TEXT NOT NULL,          -- PRE_SCAN_COMPLETED | MANUAL_BREACH_REPORT
+    action           TEXT NOT NULL,
     risk_level       TEXT NOT NULL,
-    decision         TEXT NOT NULL,          -- ALLOW | ALLOW_WITH_WARNING | BLOCK
+    decision         TEXT NOT NULL,
     pii_count        INTEGER DEFAULT 0,
     secret_count     INTEGER DEFAULT 0,
     keyword_count    INTEGER DEFAULT 0,
@@ -292,33 +259,9 @@ CREATE TABLE compliance_events (
 
 ---
 
-## Betriebsrat CSV export columns
-
-| Column | Notes |
-|--------|-------|
-| `timestamp` | ISO 8601 |
-| `user_id` | Pseudonymised (SHA-256) or real ID |
-| `filename` | Stored as-is |
-| `action` | `PRE_SCAN_COMPLETED` or `MANUAL_BREACH_REPORT` |
-| `risk_level` | `CLEAN` / `SENSITIVE_PII` / `SECRET_FOUND` / `STRUCTURAL_ANOMALY` |
-| `decision` | `ALLOW` / `ALLOW_WITH_WARNING` / `BLOCK` |
-| `pii_count` | integer |
-| `secret_count` | integer |
-| `keyword_count` | integer |
-| `anomaly_flags` | JSON array |
-| `scan_duration_ms` | integer |
-| `breach_reason` | free-text (manual reports only) |
-| `breach_severity` | LOW / MEDIUM / HIGH / CRITICAL |
-| `breach_reporter` | name or role |
-
-Raw file content is **never** included.
-
----
-
 ## Planned (next sprints)
 
-- **Phase 11 — Hit masking** — `MASK_SNIPPETS=true` env flag for production; snippets currently unmasked for dev/test
-- **Phase 12 — OPA/Rego** — externalise policy rules out of `pipeline.py` so rules can change without a code deploy
+- **Phase 12 — OPA/Rego** — externalise policy rules out of `pipeline.py` so compliance logic can change without a code deploy
 - **ClamAV sidecar** — optional clamd integration for known-malware signature scanning on raw bytes
 
 ---
