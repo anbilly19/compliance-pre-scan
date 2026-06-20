@@ -40,6 +40,10 @@ async def test_scan_clean_txt(tmp_path):
 
 @pytest.mark.asyncio
 async def test_scan_with_secret(tmp_path):
+    """
+    A file containing a real AWS access key must be BLOCKED (HTTP 451).
+    Default config: BLOCK_ON_SECRET=1, so any single secret hit => BLOCK.
+    """
     f = tmp_path / "secrets.txt"
     f.write_text(
         "Config: AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE secretsabound",
@@ -55,9 +59,9 @@ async def test_scan_with_secret(tmp_path):
             files={"file": ("secrets.txt", f.read_bytes(), "text/plain")},
         )
 
-    assert resp.status_code == 200
+    assert resp.status_code == 451
     body = resp.json()
-    assert body["decision"] == "ALLOW_WITH_WARNING"
+    assert body["decision"] == "BLOCK"
     assert len(body["secret_matches"]) > 0
 
 

@@ -12,7 +12,7 @@ Note: _derive_decision was removed in Phase 12 and replaced by the policy engine
 _evaluate_inline + PolicyInput.
 """
 import io
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -93,6 +93,10 @@ class TestPolicyEngineBlock:
 
 
 # ── integration tests: POST /scan HTTP status codes ────────────────────────────
+#
+# write_event is async — must be patched with AsyncMock, not MagicMock.
+# A plain MagicMock returns a coroutine object that FastAPI awaits successfully
+# but the endpoint continues regardless, masking the real response code.
 
 client = TestClient(app, raise_server_exceptions=False)
 
@@ -109,7 +113,7 @@ class TestScanEndpointStatusCodes:
 
     def test_clean_file_returns_200(self):
         with patch("compliance_scan.api.scan.run_scan") as mock_scan, \
-             patch("compliance_scan.api.scan.write_event"):
+             patch("compliance_scan.api.scan.write_event", new_callable=AsyncMock):
             mock_scan.return_value = ScanResult(
                 filename="clean.txt",
                 file_type_detected="text/plain",
@@ -123,7 +127,7 @@ class TestScanEndpointStatusCodes:
 
     def test_warn_file_returns_200(self):
         with patch("compliance_scan.api.scan.run_scan") as mock_scan, \
-             patch("compliance_scan.api.scan.write_event"):
+             patch("compliance_scan.api.scan.write_event", new_callable=AsyncMock):
             mock_scan.return_value = ScanResult(
                 filename="warn.txt",
                 file_type_detected="text/plain",
@@ -137,7 +141,7 @@ class TestScanEndpointStatusCodes:
 
     def test_blocked_file_returns_451(self):
         with patch("compliance_scan.api.scan.run_scan") as mock_scan, \
-             patch("compliance_scan.api.scan.write_event"):
+             patch("compliance_scan.api.scan.write_event", new_callable=AsyncMock):
             mock_scan.return_value = ScanResult(
                 filename="secrets.txt",
                 file_type_detected="text/plain",
@@ -155,7 +159,7 @@ class TestScanEndpointStatusCodes:
     def test_blocked_response_contains_full_scan_result(self):
         """Caller must be able to display why the file was blocked."""
         with patch("compliance_scan.api.scan.run_scan") as mock_scan, \
-             patch("compliance_scan.api.scan.write_event"):
+             patch("compliance_scan.api.scan.write_event", new_callable=AsyncMock):
             mock_scan.return_value = ScanResult(
                 filename="evil.pdf",
                 file_type_detected="application/x-dosexec",
