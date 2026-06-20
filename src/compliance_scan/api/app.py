@@ -8,12 +8,16 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..audit.db import init_db, list_events, write_event
 from ..audit.export import generate_csv
-from ..audit.models import ScanResult
+from ..audit.models import Decision, ScanResult
 from ..pipeline import run_scan
+
+
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".txt", ".rtf"}
+HTTP_BLOCKED = 451
 
 
 @asynccontextmanager
@@ -30,31 +34,38 @@ app = FastAPI(
 )
 
 
-@app.post("/scan", response_model=ScanResult)
+@app.post("/scan")
 async def scan_file(
     file: UploadFile = File(...),
     user_id: str = Form(...),
     session_id: str = Form(default=""),
-) -> ScanResult:
+):
     """
-    Accepts a file upload, runs the full compliance scan pipeline, writes an
-    audit event, and returns the ScanResult.
+    Pre-upload compliance scan.
 
-    The caller should:
-      - Allow the upload to proceed if decision == ALLOW.
-      - Show a warning banner if decision == ALLOW_WITH_WARNING.
-      - Block the upload if decision == BLOCK (future policy upgrade path).
+    Returns
+    -------
+    200  ScanResult JSON   decision == ALLOW or ALLOW_WITH_WARNING
+    451  ScanResult JSON   decision == BLOCK  (file must not be forwarded to LLM)
+    415  error JSON        unsupported file type
     """
-    content = await file.read()
     filename = file.filename or "unknown"
+    ext = Path(filename).suffix.lower()
 
-    suffix = Path(filename).suffix or ".bin"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type '{ext}'. Supported: {sorted(SUPPORTED_EXTENSIONS)}",
+        )
+
+    content = await file.read()
+
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         tmp.write(content)
         tmp_path = Path(tmp.name)
 
     try:
-        result = run_scan(tmp_path, filename=filename)
+        result: ScanResult = run_scan(tmp_path, filename=filename)
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -66,7 +77,12 @@ async def scan_file(
         result=result,
     )
 
-    return result
+    result_dict = result.model_dump(mode="json")
+
+    if result.decision == Decision.BLOCK:
+        return JSONResponse(status_code=HTTP_BLOCKED, content=result_dict)
+
+    return JSONResponse(status_code=200, content=result_dict)
 
 
 @app.get("/events")

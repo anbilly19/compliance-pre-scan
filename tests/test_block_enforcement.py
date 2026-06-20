@@ -6,10 +6,14 @@ Covers:
 - policy engine returns ALLOW_WITH_WARNING (not BLOCK) when block thresholds are at 0/False
 - POST /scan returns HTTP 451 when decision == BLOCK
 - POST /scan returns HTTP 200 when decision is ALLOW or ALLOW_WITH_WARNING
+- POST /scan returns HTTP 415 for unsupported file types
 
 Note: _derive_decision was removed in Phase 12 and replaced by the policy engine
 (compliance_scan.policy.engine). The unit tests below test the same logic via
 _evaluate_inline + PolicyInput.
+
+IMPORTANT: run_scan and write_event are imported directly into app.py, so patches
+must target compliance_scan.api.app.run_scan and compliance_scan.api.app.write_event.
 """
 import io
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -94,9 +98,11 @@ class TestPolicyEngineBlock:
 
 # ── integration tests: POST /scan HTTP status codes ────────────────────────────
 #
-# write_event is async — must be patched with AsyncMock, not MagicMock.
-# A plain MagicMock returns a coroutine object that FastAPI awaits successfully
-# but the endpoint continues regardless, masking the real response code.
+# run_scan and write_event are imported directly in app.py, so patches must
+# target compliance_scan.api.app.<name>, not compliance_scan.api.scan.<name>.
+#
+# write_event is async — must use AsyncMock or the await in the handler
+# silently swallows the mock and the endpoint returns 200 regardless.
 
 client = TestClient(app, raise_server_exceptions=False)
 
@@ -112,8 +118,8 @@ def _upload(content: bytes, filename: str = "test.txt"):
 class TestScanEndpointStatusCodes:
 
     def test_clean_file_returns_200(self):
-        with patch("compliance_scan.api.scan.run_scan") as mock_scan, \
-             patch("compliance_scan.api.scan.write_event", new_callable=AsyncMock):
+        with patch("compliance_scan.api.app.run_scan") as mock_scan, \
+             patch("compliance_scan.api.app.write_event", new_callable=AsyncMock):
             mock_scan.return_value = ScanResult(
                 filename="clean.txt",
                 file_type_detected="text/plain",
@@ -126,8 +132,8 @@ class TestScanEndpointStatusCodes:
         assert resp.json()["decision"] == "ALLOW"
 
     def test_warn_file_returns_200(self):
-        with patch("compliance_scan.api.scan.run_scan") as mock_scan, \
-             patch("compliance_scan.api.scan.write_event", new_callable=AsyncMock):
+        with patch("compliance_scan.api.app.run_scan") as mock_scan, \
+             patch("compliance_scan.api.app.write_event", new_callable=AsyncMock):
             mock_scan.return_value = ScanResult(
                 filename="warn.txt",
                 file_type_detected="text/plain",
@@ -140,8 +146,8 @@ class TestScanEndpointStatusCodes:
         assert resp.json()["decision"] == "ALLOW_WITH_WARNING"
 
     def test_blocked_file_returns_451(self):
-        with patch("compliance_scan.api.scan.run_scan") as mock_scan, \
-             patch("compliance_scan.api.scan.write_event", new_callable=AsyncMock):
+        with patch("compliance_scan.api.app.run_scan") as mock_scan, \
+             patch("compliance_scan.api.app.write_event", new_callable=AsyncMock):
             mock_scan.return_value = ScanResult(
                 filename="secrets.txt",
                 file_type_detected="text/plain",
@@ -158,8 +164,8 @@ class TestScanEndpointStatusCodes:
 
     def test_blocked_response_contains_full_scan_result(self):
         """Caller must be able to display why the file was blocked."""
-        with patch("compliance_scan.api.scan.run_scan") as mock_scan, \
-             patch("compliance_scan.api.scan.write_event", new_callable=AsyncMock):
+        with patch("compliance_scan.api.app.run_scan") as mock_scan, \
+             patch("compliance_scan.api.app.write_event", new_callable=AsyncMock):
             mock_scan.return_value = ScanResult(
                 filename="evil.pdf",
                 file_type_detected="application/x-dosexec",
