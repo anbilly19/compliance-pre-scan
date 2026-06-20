@@ -1,14 +1,17 @@
 """Phase 10 — tests for BLOCK decision enforcement.
 
 Covers:
-- pipeline._derive_decision() returns BLOCK for secrets when block_on_secret > 0
-- pipeline._derive_decision() returns BLOCK for structural anomalies when block_on_structural_anomaly=True
-- pipeline._derive_decision() returns ALLOW_WITH_WARNING (not BLOCK) when block thresholds are at 0/False
+- policy engine returns BLOCK for secrets when block_on_secret > 0
+- policy engine returns BLOCK for structural anomalies when block_on_structural_anomaly=True
+- policy engine returns ALLOW_WITH_WARNING (not BLOCK) when block thresholds are at 0/False
 - POST /scan returns HTTP 451 when decision == BLOCK
 - POST /scan returns HTTP 200 when decision is ALLOW or ALLOW_WITH_WARNING
+
+Note: _derive_decision was removed in Phase 12 and replaced by the policy engine
+(compliance_scan.policy.engine). The unit tests below test the same logic via
+_evaluate_inline + PolicyInput.
 """
 import io
-import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,17 +19,21 @@ from fastapi.testclient import TestClient
 
 from compliance_scan.api.app import app
 from compliance_scan.audit.models import RiskLevel, Decision, RuleHit, ScanResult
-from compliance_scan.pipeline import _derive_decision
+from compliance_scan.policy.engine import PolicyInput, _evaluate_inline
 
 
-# ─── helpers ──────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
-def _make_identity(mismatch: bool = False):
-    identity = MagicMock()
-    identity.mime_detected = "application/pdf"
-    identity.mime_from_extension = "application/pdf"
-    identity.extension_mismatch = mismatch
-    return identity
+def _mock_settings(**overrides):
+    m = MagicMock()
+    m.pii_warn_threshold = 1
+    m.secret_warn_threshold = 1
+    m.block_on_secret = 1
+    m.block_on_pii = 0
+    m.block_on_structural_anomaly = False
+    for k, v in overrides.items():
+        setattr(m, k, v)
+    return m
 
 
 def _secret_hit() -> RuleHit:
@@ -41,124 +48,51 @@ def _pii_hit() -> RuleHit:
     return RuleHit(scanner="PII", rule_id="EMAIL_ADDRESS", severity="HIGH", match_snippet="u@e.de")
 
 
-# ─── unit tests: _derive_decision ─────────────────────────────────────────────
+# ── unit tests: policy engine block behaviour ───────────────────────────────────────
 
-class TestDeriveDecisionBlock:
+class TestPolicyEngineBlock:
 
     def test_secret_triggers_block_when_threshold_1(self):
-        with patch("compliance_scan.pipeline.settings") as s:
-            s.secret_warn_threshold = 1
-            s.block_on_secret = 1
-            s.pii_warn_threshold = 1
-            s.block_on_pii = 0
-            s.block_on_structural_anomaly = False
-
-            result = _derive_decision(
-                filename="test.txt",
-                identity=_make_identity(),
-                pii_hits=[],
-                secret_hits=[_secret_hit()],
-                keyword_hits=[],
-                anomaly_hits=[],
-            )
+        with patch("compliance_scan.policy.engine.settings",
+                   _mock_settings(block_on_secret=1)):
+            result = _evaluate_inline(PolicyInput(secret_count=1))
         assert result.decision == Decision.BLOCK
         assert result.risk_level == RiskLevel.SECRET_FOUND
 
     def test_no_block_when_block_on_secret_zero(self):
-        with patch("compliance_scan.pipeline.settings") as s:
-            s.secret_warn_threshold = 1
-            s.block_on_secret = 0
-            s.pii_warn_threshold = 1
-            s.block_on_pii = 0
-            s.block_on_structural_anomaly = False
-
-            result = _derive_decision(
-                filename="test.txt",
-                identity=_make_identity(),
-                pii_hits=[],
-                secret_hits=[_secret_hit()],
-                keyword_hits=[],
-                anomaly_hits=[],
-            )
+        with patch("compliance_scan.policy.engine.settings",
+                   _mock_settings(block_on_secret=0)):
+            result = _evaluate_inline(PolicyInput(secret_count=1))
         assert result.decision == Decision.ALLOW_WITH_WARNING
 
     def test_structural_anomaly_blocks_when_enabled(self):
-        with patch("compliance_scan.pipeline.settings") as s:
-            s.secret_warn_threshold = 1
-            s.block_on_secret = 1
-            s.pii_warn_threshold = 1
-            s.block_on_pii = 0
-            s.block_on_structural_anomaly = True
-
-            result = _derive_decision(
-                filename="evil.exe",
-                identity=_make_identity(mismatch=True),
-                pii_hits=[],
-                secret_hits=[],
-                keyword_hits=[],
-                anomaly_hits=[_high_anomaly_hit()],
-            )
+        with patch("compliance_scan.policy.engine.settings",
+                   _mock_settings(block_on_secret=0, block_on_structural_anomaly=True)):
+            result = _evaluate_inline(PolicyInput(high_anomaly_count=1))
         assert result.decision == Decision.BLOCK
         assert result.risk_level == RiskLevel.STRUCTURAL_ANOMALY
 
     def test_structural_anomaly_warns_only_when_disabled(self):
-        with patch("compliance_scan.pipeline.settings") as s:
-            s.secret_warn_threshold = 1
-            s.block_on_secret = 0
-            s.pii_warn_threshold = 1
-            s.block_on_pii = 0
-            s.block_on_structural_anomaly = False
-
-            result = _derive_decision(
-                filename="suspicious.pdf",
-                identity=_make_identity(),
-                pii_hits=[],
-                secret_hits=[],
-                keyword_hits=[],
-                anomaly_hits=[_high_anomaly_hit()],
-            )
+        with patch("compliance_scan.policy.engine.settings",
+                   _mock_settings(block_on_secret=0, block_on_structural_anomaly=False)):
+            result = _evaluate_inline(PolicyInput(high_anomaly_count=1))
         assert result.decision == Decision.ALLOW_WITH_WARNING
 
     def test_pii_block_threshold_respected(self):
-        pii_hits = [_pii_hit() for _ in range(5)]
-        with patch("compliance_scan.pipeline.settings") as s:
-            s.secret_warn_threshold = 1
-            s.block_on_secret = 1
-            s.pii_warn_threshold = 1
-            s.block_on_pii = 5
-            s.block_on_structural_anomaly = False
-
-            result = _derive_decision(
-                filename="personal.pdf",
-                identity=_make_identity(),
-                pii_hits=pii_hits,
-                secret_hits=[],
-                keyword_hits=[],
-                anomaly_hits=[],
-            )
+        with patch("compliance_scan.policy.engine.settings",
+                   _mock_settings(block_on_secret=0, block_on_pii=5)):
+            result = _evaluate_inline(PolicyInput(pii_count=5))
         assert result.decision == Decision.BLOCK
 
     def test_clean_file_allowed(self):
-        with patch("compliance_scan.pipeline.settings") as s:
-            s.secret_warn_threshold = 1
-            s.block_on_secret = 1
-            s.pii_warn_threshold = 1
-            s.block_on_pii = 0
-            s.block_on_structural_anomaly = True
-
-            result = _derive_decision(
-                filename="clean.txt",
-                identity=_make_identity(),
-                pii_hits=[],
-                secret_hits=[],
-                keyword_hits=[],
-                anomaly_hits=[],
-            )
+        with patch("compliance_scan.policy.engine.settings",
+                   _mock_settings(block_on_secret=1, block_on_structural_anomaly=True)):
+            result = _evaluate_inline(PolicyInput())
         assert result.decision == Decision.ALLOW
         assert result.risk_level == RiskLevel.CLEAN
 
 
-# ─── integration tests: POST /scan HTTP status codes ─────────────────────────
+# ── integration tests: POST /scan HTTP status codes ────────────────────────────
 
 client = TestClient(app, raise_server_exceptions=False)
 
