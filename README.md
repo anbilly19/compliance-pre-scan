@@ -17,7 +17,7 @@
 | 6 | Logging (rotating file + console) | ✅ Done |
 | 7 | False-positive suppression (technical + financial docs) | ✅ Done |
 | 8 | ClamAV / YARA integration | ⬜ Planned |
-| 9 | Manual breach report UI button | ⬜ Planned |
+| 9 | Manual breach report UI + `POST /compliance/breach-report` | ✅ Done |
 | 10 | BLOCK enforcement in chat layer | ⬜ Planned |
 | 11 | Hit masking config flag (test vs production) | ⬜ Planned |
 | 12 | OPA/Rego policy externalisation | ⬜ Planned |
@@ -36,7 +36,7 @@ When a user selects a file for upload in the chat platform, this service interce
 6. **Structural anomaly heuristics** — entropy, size-vs-text ratio, extension mismatch, embedded macros/OLE objects
 7. **False-positive suppression** — technical procurement docs and financial cost sheets are classified and irrelevant NER hits (ORG/LOC fragments) are dropped automatically
 8. **Policy decision** — maps scan results to a risk level and decision (ALLOW / ALLOW_WITH_WARNING / BLOCK)
-9. **Audit event log** — every scan and decision is appended as an immutable SQLite row
+9. **Audit event log** — every scan and manual breach report is appended as an immutable SQLite row
 10. **Betriebsrat CSV export** — date-range filtered export for works council / internal audit
 
 No LLMs are used at any point. All processing is local and offline-capable.
@@ -63,7 +63,7 @@ Detailed examples and suppression logic live in the `docs/` folder:
 ### PII (via Microsoft Presidio — MIT)
 
 | Entity | Examples | Severity | Languages |
-|--------|----------|----------|-----------|
+|--------|----------|----------|-----------| 
 | `EMAIL_ADDRESS` | `max.mustermann@firma.de` | HIGH | EN + DE |
 | `PHONE_NUMBER` | `+49 211 1234567` | HIGH | EN + DE |
 | `IBAN_CODE` | `DE89 3704 0044 0532 0130 00` | HIGH | EN + DE |
@@ -238,18 +238,33 @@ CREATE TABLE compliance_events (
     session_id       TEXT,
     upload_id        TEXT NOT NULL,
     filename         TEXT NOT NULL,
-    action           TEXT NOT NULL,
+    action           TEXT NOT NULL,          -- PRE_SCAN_COMPLETED | MANUAL_BREACH_REPORT
     risk_level       TEXT NOT NULL,
     decision         TEXT NOT NULL,
     pii_count        INTEGER DEFAULT 0,
     secret_count     INTEGER DEFAULT 0,
     keyword_count    INTEGER DEFAULT 0,
     anomaly_flags    TEXT DEFAULT '[]',
-    scan_duration_ms INTEGER
+    scan_duration_ms INTEGER,
+    breach_reason    TEXT,                   -- only for MANUAL_BREACH_REPORT
+    breach_severity  TEXT,                   -- LOW | MEDIUM | HIGH | CRITICAL
+    breach_reporter  TEXT                    -- user or role who filed the report
 );
 ```
 
-Every scan writes one row. Manual breach reports and override events will add additional row types (`MANUAL_BREACH_REPORT`, `MANUAL_OVERRIDE`) in a future sprint.
+Every automated scan writes one `PRE_SCAN_COMPLETED` row.  
+Manual breach reports write a `MANUAL_BREACH_REPORT` row via `POST /compliance/breach-report`.
+
+---
+
+## API endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/scan` | Pre-upload scan; returns `ScanResult` + writes audit event |
+| `GET` | `/compliance/events` | List audit events (filterable by user, date, action) |
+| `GET` | `/compliance/events/export` | Download events as CSV (Betriebsrat export) |
+| `POST` | `/compliance/breach-report` | Submit manual data breach / compliance concern report |
 
 ---
 
@@ -260,6 +275,7 @@ Every scan writes one row. Manual breach reports and override events will add ad
 | `timestamp` | ISO 8601 |
 | `user_id` | Pseudonymised (SHA-256) or real ID for authorised exports |
 | `filename` | Stored as-is in current test mode |
+| `action` | `PRE_SCAN_COMPLETED` or `MANUAL_BREACH_REPORT` |
 | `risk_level` | `CLEAN` / `SENSITIVE_PII` / `SECRET_FOUND` / `STRUCTURAL_ANOMALY` |
 | `decision` | `ALLOW` / `ALLOW_WITH_WARNING` / `BLOCK` |
 | `pii_count` | integer |
@@ -267,6 +283,9 @@ Every scan writes one row. Manual breach reports and override events will add ad
 | `keyword_count` | integer |
 | `anomaly_flags` | JSON array |
 | `scan_duration_ms` | integer |
+| `breach_reason` | free-text (manual reports only) |
+| `breach_severity` | LOW / MEDIUM / HIGH / CRITICAL (manual reports only) |
+| `breach_reporter` | name or role (manual reports only) |
 
 Raw file content is **never** included in the export.
 
@@ -274,7 +293,6 @@ Raw file content is **never** included in the export.
 
 ## Planned (next sprints)
 
-- **Manual breach report** — "Datenpanne melden" button in UI creates a `MANUAL_BREACH_REPORT` audit event with free-text reason and severity
 - **BLOCK enforcement** — hard-block at chat layer when backend returns `BLOCK`; currently wired but not enforced
 - **Hit masking config flag** — `MASK_SNIPPETS=true` for production; currently off for testing
 - **ClamAV integration** — optional sidecar for known-malware signature scanning
