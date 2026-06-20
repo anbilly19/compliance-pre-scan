@@ -1,135 +1,64 @@
-# Detection examples — keywords and confidentiality
+# Detection examples — keywords and confidentiality markers
 
-This document shows examples of organisation-specific keyword matches that should raise concerns even when no structured PII or secret is present.
-
-Keywords are useful for catching sensitive business content such as labour-council material, legal drafts, internal-only project notes, or financial planning documents.
+Keyword matching uses Aho-Corasick pattern matching against configurable YAML lists. It runs after PII and secret scanning as a third signal layer.
 
 ---
 
-## Typical cases that should be flagged
+## Keyword lists
 
-### 1. Labour council / Betriebsrat material
+Lists live in `config/keywords/`. Each YAML file contains a list of terms (case-insensitive by default).
 
-**Example content**
+| File | Sample triggers |
+|------|-----------------|
+| `confidentiality.yaml` | Geheimhaltungsvereinbarung, NDA, vertraulich, confidential, internal only, unter Verschluss |
+| `hr.yaml` | Betriebsrat, Personalakte, Gehalt, Lohnabrechnung, Kündigung, Abmahnung, Zeugnis |
+| `finance.yaml` | Jahresabschluss, Bilanz, Gewinn und Verlust, Steuerprüfung, IBAN, Kontonummer |
+| `legal.yaml` | EVB-IT, Vergaberecht, VOB, Rechtsstreit, Klage, Vergleich, Schadensersatz |
 
-```text
-Vorlage für den Betriebsrat
-Besprechung zur personellen Einzelmaßnahme
+---
+
+## Policy outcome
+
+- Any keyword hit → `risk_level=SENSITIVE_PII`, `decision=ALLOW_WITH_WARNING`, HTTP 200
+- Keywords never trigger a BLOCK on their own — they are a soft signal
+- The `reason` field will be `keyword_match`
+- If PII or secrets are also present, the higher-severity decision takes precedence (BLOCK beats WARNING)
+
+---
+
+## Hit masking (`MASK_SNIPPETS=true`)
+
+Keyword hits pass through masking **unchanged** — the matched term itself is not sensitive (it is a category label, not personal data):
+
+| Original | Masked |
+|----------|--------|
+| `Betriebsrat` | `Betriebsrat` |
+| `CONFIDENTIAL` | `CONFIDENTIAL` |
+| `Personalakte` | `Personalakte` |
+
+---
+
+## Adding custom keywords
+
+Add a new YAML file to `config/keywords/` and reference it in `KEYWORD_CONFIG_PATHS` in `.env`:
+
+```yaml
+# config/keywords/projects.yaml
+- Project Phoenix
+- Projekt Alpha
+- client-XYZ
+- internal-reference-12345
 ```
 
-**Expected flags**
-
-- keyword: `Betriebsrat`
-- keyword: `personelle Einzelmaßnahme` if configured
-
-**Expected outcome**
-
-- Risk level: `SENSITIVE_PII` or keyword-based warning level
-- Decision: `ALLOW_WITH_WARNING`
-- Audit trail should show keyword hit source
-
----
-
-### 2. Confidential contract draft
-
-**Example content**
-
-```text
-Strictly confidential
-Draft service agreement
-Not for external distribution
+```env
+KEYWORD_CONFIG_PATHS=config/keywords/confidentiality.yaml,config/keywords/hr.yaml,config/keywords/projects.yaml
 ```
 
-**Expected flags**
-
-- keyword: `strictly confidential`
-- keyword: `not for external distribution`
-
-**Expected outcome**
-
-- Risk level: `SENSITIVE_PII` or confidentiality warning
-- Decision: `ALLOW_WITH_WARNING`
+No restart required if using OPA for policy — keyword lists are loaded at scanner initialisation, so a service restart is needed to pick up changes.
 
 ---
 
-### 3. Legal / procurement material
+## Tuning weak signals
 
-**Example content**
-
-```text
-EVB-IT Vertrag
-Vergabeverfahren
-VOB Abweichung
-```
-
-**Expected flags**
-
-- legal/procurement keywords depending on configured YAML list
-
-**Expected outcome**
-
-- warning banner because the document is likely sensitive business material
-
----
-
-### 4. Finance and audit planning
-
-**Example content**
-
-```text
-Jahresabschluss 2026
-Steuerprüfung vorbereitet
-Bilanzentwurf intern
-```
-
-**Expected flags**
-
-- finance keywords like `Jahresabschluss`, `Steuerprüfung`, `Bilanz`
-
-**Expected outcome**
-
-- warning banner even if no PII exists
-
----
-
-## Cases that should be handled carefully
-
-### 1. Generic words with multiple meanings
-
-**Example content**
-
-```text
-This is a draft plan for a workshop.
-```
-
-**Risk**
-
-- a broad keyword like `draft` alone is too generic
-
-**Action**
-
-- prefer phrases, domain terms, or weighted combinations instead of weak single words
-
----
-
-### 2. Department names without sensitive context
-
-**Example content**
-
-```text
-Meeting with Finance next week.
-```
-
-**Risk**
-
-- `Finance` by itself may be too broad to justify a warning
-
-**Action**
-
-- use multi-keyword rules or score-based matching for low-specificity terms
-
----
-
-## Operational note
-
-Keyword rules should remain tenant-specific and editable because they reflect internal language, project names, council terms, and business sensitivity definitions unique to each organisation.
+- Very common German words (`Vertrag`, `Rechnung`) that appear in routine docs may produce noise — remove them from the list or move them to a separate lower-priority list
+- Combine keyword hits with PII count in the policy to raise severity: e.g. use OPA/Rego to add a custom rule that blocks when `keyword_count > 0 AND pii_count > 5`

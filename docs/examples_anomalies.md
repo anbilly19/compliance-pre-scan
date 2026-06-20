@@ -1,145 +1,88 @@
-# Detection examples — anomalies and suspicious files
+# Detection examples — structural anomalies and suspicious files
 
-This document shows examples of files that should raise structural or malicious-content concerns before upload.
-
-These checks are important because the file may be dangerous or deceptive even when the extracted text looks harmless.
+The anomaly scanner runs on the raw file (not extracted text) and checks for structural red flags that may indicate a disguised payload, embedded malicious content, or a deliberately crafted file.
 
 ---
 
-## Typical cases that should be flagged
+## Checks performed
 
-### 1. Extension mismatch
-
-**Example case**
-
-- File is named `report.pdf`
-- Magic bytes identify it as an executable or generic binary
-
-**Expected flags**
-
-- anomaly: extension mismatch
-- file identity mismatch in summary
-
-**Expected outcome**
-
-- Risk level: `STRUCTURAL_ANOMALY`
-- Decision: `ALLOW_WITH_WARNING` now, later eligible for `BLOCK`
+| Check | Trigger condition | Severity |
+|-------|-------------------|----------|
+| Extension mismatch | MIME magic ≠ declared extension (e.g. `.pdf` but binary is EXE) | HIGH |
+| High entropy | Shannon entropy > `ENTROPY_HIGH_THRESHOLD` (default: 7.2) on file chunks — suggests encrypted or compressed payload hidden inside | MEDIUM |
+| Size vs text ratio | `file_size_bytes / len(extracted_text) > SIZE_RATIO_THRESHOLD` (default: 50) — large file, almost no readable text | MEDIUM |
+| Embedded macro | DOCX/XLSX contains VBA macros or OLE objects | MEDIUM |
+| Archive bomb | ZIP recursion depth > `MAX_ARCHIVE_DEPTH` (default: 2) or unpacked size exceeds limit | HIGH |
 
 ---
 
-### 2. Macro-enabled office file
+## Policy outcome
 
-**Example case**
-
-- User uploads an XLSM or DOCM file with embedded VBA project
-
-**Expected flags**
-
-- anomaly: macro detected
-- optional escalation if macros are forbidden by policy
-
-**Expected outcome**
-
-- warning banner
-- audit event notes structural anomaly
+- **HIGH anomaly** (extension mismatch, archive bomb):
+  - `BLOCK_ON_STRUCTURAL_ANOMALY=true` (default) → **`BLOCK`, HTTP 451**, `reason=block_on_structural_anomaly`
+  - `BLOCK_ON_STRUCTURAL_ANOMALY=false` → `ALLOW_WITH_WARNING`, HTTP 200, `reason=high_anomaly`
+- **MEDIUM anomaly** (entropy, size ratio, macro):
+  - Always `ALLOW_WITH_WARNING`, HTTP 200
+  - Never triggers BLOCK on its own
+- `risk_level` is always `STRUCTURAL_ANOMALY` for any anomaly hit
 
 ---
 
-### 3. Suspiciously large file with very little text
+## Hit masking (`MASK_SNIPPETS=true`)
 
-**Example case**
+Anomaly hits pass through masking **unchanged** — they contain structural metadata, not personal data:
 
-- 40 MB file
-- only a few lines of extracted text
-
-**Why it matters**
-
-- could indicate embedded payloads, excessive binary objects, or malformed content
-
-**Expected flags**
-
-- anomaly: high size-to-text ratio
-- possibly high entropy as well
-
-**Expected outcome**
-
-- Risk level: `STRUCTURAL_ANOMALY`
-- Decision: `ALLOW_WITH_WARNING`
+| Original snippet | Masked |
+|-----------------|--------|
+| `extension_mismatch: declared=pdf detected=application/x-dosexec` | unchanged |
+| `high_entropy: score=7.8 offset=0x1000` | unchanged |
+| `macro_detected: vba_modules=2` | unchanged |
 
 ---
 
-### 4. High entropy binary chunks
+## Examples
 
-**Example case**
+### Extension mismatch
 
-- raw bytes contain long high-entropy regions inconsistent with a normal office document
+```
+file: invoice.pdf
+detected MIME: application/x-dosexec
+declared MIME: application/pdf
+→ HIGH anomaly: extension_mismatch
+→ BLOCK (default) or ALLOW_WITH_WARNING
+```
 
-**Why it matters**
+### High entropy blob
 
-- may indicate compressed, encrypted, or packed payloads
+```
+file: report.docx
+entropy at offset 0x4000: 7.9 (threshold: 7.2)
+→ MEDIUM anomaly: high_entropy
+→ ALLOW_WITH_WARNING
+```
 
-**Expected flags**
+### Archive bomb
 
-- anomaly: entropy threshold exceeded
+```
+file: data.zip
+recursion depth: 4 (limit: 2)
+→ HIGH anomaly: archive_bomb
+→ BLOCK (default)
+```
 
-**Expected outcome**
+### Macro in Office file
 
-- warning banner and audit entry
-
----
-
-### 5. Archive bomb or nested archive abuse
-
-**Example case**
-
-- ZIP file expands massively or has deep nesting
-
-**Expected flags**
-
-- anomaly: archive depth exceeded
-- anomaly: unpacked size limit exceeded
-
-**Expected outcome**
-
-- should be considered a strong candidate for future `BLOCK`
-
----
-
-## Cases that are noisy but not necessarily malicious
-
-### 1. Image-heavy PDF
-
-**Example case**
-
-- scanned PDF brochure with almost no OCR text
-
-**Risk**
-
-- may trigger high size-to-text ratio even though it is benign
-
-**Action**
-
-- treat as warning, not immediate block
-- improve OCR or file-type-specific thresholds later
+```
+file: template.docx
+OLE object found: vba_modules=3
+→ MEDIUM anomaly: macro_detected
+→ ALLOW_WITH_WARNING
+```
 
 ---
 
-### 2. Legitimate compressed engineering bundle
+## Tuning
 
-**Example case**
-
-- archive with CAD exports and binary assets
-
-**Risk**
-
-- entropy and size heuristics may trigger
-
-**Action**
-
-- keep warning path, review thresholds per tenant or per allowed file class
-
----
-
-## Operational note
-
-Anomaly checks are the main place where future malware-oriented controls can be extended with ClamAV, YARA, or content disarm rules without changing the rest of the pipeline.
+- Raise `ENTROPY_HIGH_THRESHOLD` (e.g. to 7.5) to reduce noise from legitimately compressed documents
+- Raise `SIZE_RATIO_THRESHOLD` for environments where large binary attachments are expected
+- Set `BLOCK_ON_STRUCTURAL_ANOMALY=false` if your platform commonly handles files with unusual structures and you prefer a warning-only mode

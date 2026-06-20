@@ -1,140 +1,58 @@
 # Detection examples — PII
 
-This document shows concrete examples of files that should raise PII-related concerns during the pre-upload scan.
-
-The system raises a PII concern when extracted text contains personal identifiers such as names, email addresses, phone numbers, IBANs, card numbers, or addresses. In the current implementation, any PII hit at or above threshold leads to `risk_level = SENSITIVE_PII` and `decision = ALLOW_WITH_WARNING`.
+PII detection uses [Microsoft Presidio](https://github.com/microsoft/presidio) (MIT) with bilingual EN + DE NER models and regex recognisers. Detection runs on extracted text only — no file content is sent to any external service.
 
 ---
 
-## Typical cases that should be flagged
+## What triggers a PII hit
 
-### 1. CV / resume
-
-**Example content**
-
-```text
-Max Mustermann
-max.mustermann@firma.de
-+49 171 1234567
-Musterstraße 12, 40213 Düsseldorf
-Geboren am 12.03.1992
-```
-
-**Expected flags**
-
-- `PERSON` → `Max Mustermann`
-- `EMAIL_ADDRESS` → `max.mustermann@firma.de`
-- `PHONE_NUMBER` → `+49 171 1234567`
-- `LOCATION` → `Musterstraße 12, 40213 Düsseldorf`
-- `DATE_TIME` → `12.03.1992`
-
-**Expected outcome**
-
-- Risk level: `SENSITIVE_PII`
-- Decision: `ALLOW_WITH_WARNING`
-- Audit: one event row with `pii_count > 0`
+| Entity type | Example | Severity | Notes |
+|-------------|---------|----------|---------|
+| `EMAIL_ADDRESS` | `max.mustermann@firma.de` | HIGH | Regex |
+| `PHONE_NUMBER` | `+49 211 1234567`, `0211/123456` | HIGH | DE + EN patterns |
+| `IBAN_CODE` | `DE89 3704 0044 0532 0130 00` | HIGH | Checksum validated |
+| `CREDIT_CARD` | `4111 1111 1111 1111` | HIGH | Luhn validated |
+| `PERSON` | `Max Mustermann`, `Anna Schmidt` | MEDIUM | spaCy NER |
+| `LOCATION` | Street address, city | MEDIUM | Suppressed in financial/technical docs |
+| `ORGANIZATION` | Company names | MEDIUM | Suppressed in financial/technical docs |
+| `IP_ADDRESS` | `192.168.1.1`, `10.0.0.1` | LOW | Regex |
+| `DATE_TIME` | `01.01.1985`, `1985-01-01` | LOW | Context-dependent |
 
 ---
 
-### 2. HR letter
+## Policy outcome
 
-**Example content**
-
-```text
-Betreff: Abmahnung
-Mitarbeiterin: Anna Schmidt
-Personalnummer: 4711
-Wohnort: Essen
-Telefon: 0201 123456
-```
-
-**Expected flags**
-
-- `PERSON`
-- `PHONE_NUMBER`
-- possibly `LOCATION`
-- keyword hits from HR list such as `Abmahnung`
-
-**Expected outcome**
-
-- Risk level: `SENSITIVE_PII`
-- Decision: `ALLOW_WITH_WARNING`
-- Reason: personal employee data in HR context
+- Any PII hit ≥ `PII_WARN_THRESHOLD` (default: 1) → `ALLOW_WITH_WARNING`, HTTP 200
+- PII hits ≥ `BLOCK_ON_PII` (default: 0, disabled) → `BLOCK`, HTTP 451
+- The `reason` field in the result will be `pii_warn` or `block_on_pii`
 
 ---
 
-### 3. Customer communication with banking data
+## Hit masking (`MASK_SNIPPETS=true`)
 
-**Example content**
+PII snippets are masked before being written to the audit log and returned in the API response:
 
-```text
-Bitte erstatten Sie den Betrag auf folgendes Konto:
-IBAN: DE89 3704 0044 0532 0130 00
-Kontoinhaber: Maria Keller
-```
+| Original | Masked |
+|----------|--------|
+| `max.mustermann@firma.de` | `ma***de` |
+| `+49 211 1234567` | `+4***67` |
+| `DE89 3704 0044 0532 0130 00` | `DE***00` |
+| `Max Mustermann` | `Ma***nn` |
 
-**Expected flags**
-
-- `IBAN_CODE`
-- `PERSON`
-- optional finance keywords depending on configured lists
-
-**Expected outcome**
-
-- Risk level: `SENSITIVE_PII`
-- Decision: `ALLOW_WITH_WARNING`
+Rule: keep first 2 + last 2 characters, replace middle with `***`.
 
 ---
 
-## Cases that should NOT be escalated as real PII
+## False-positive suppression
 
-### 1. Technical procurement documents
+Documents classified as **financial cost sheets** or **technical procurement docs** have `ORGANIZATION` and `LOCATION` hits automatically suppressed. NER confidence thresholds are also raised by 0.05 on these document types.
 
-**Example content**
-
-```text
-Ausschreibung gemäß DIN EN 1090
-Leistungsumfang: Montage und Inbetriebnahme
-Siemens Schaltschrank
-Projektstandort: Essen
-```
-
-**Why this should not flood the UI**
-
-- `ORGANIZATION` and `LOCATION` may be detected by NER
-- the document classifier marks this as technical
-- technical suppression removes low-value ORG/LOC noise
-
-**Expected outcome**
-
-- Remaining PII hits should be reduced strongly
-- No warning unless other real PII exists
+See [false_positive_suppression.md](false_positive_suppression.md) for full details.
 
 ---
 
-### 2. Financial cost sheets with company/location fragments
+## Tuning
 
-**Example content**
-
-```text
-Kostenerfassung
-Kunde: SMGB Mülheim / BWW
-Std. Satz 44.00
-GESAMT-Kosten in EUR
-```
-
-**Why this should not flood the UI**
-
-- finance classifier detects this as cost-sheet content
-- `ORGANIZATION` and `LOCATION` hits are suppressed entirely
-- short client codes like `SMGB`, `BWW`, `MRM` are treated as noise in this context
-
-**Expected outcome**
-
-- ideally zero PII hits unless actual personal data is present
-
----
-
-## Operational note
-
-PII hits are currently shown unmasked in test mode so tuning is easier. In production, masking should be re-enabled via config so the audit trail and UI expose only redacted snippets.
+- Raise `PII_WARN_THRESHOLD` in `.env` to reduce noise for documents with many incidental names
+- Enable `BLOCK_ON_PII` (e.g. `BLOCK_ON_PII=10`) for high-security environments
+- HIGH-severity types (`EMAIL_ADDRESS`, `PHONE_NUMBER`, `IBAN_CODE`, `CREDIT_CARD`) are never suppressed by the false-positive classifier
