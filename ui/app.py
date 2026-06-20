@@ -6,8 +6,8 @@ Then run UI:          streamlit run ui/app.py
 """
 from __future__ import annotations
 
+import io
 import os
-from pathlib import Path
 
 import pandas as pd
 import requests
@@ -22,18 +22,15 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── CSS — explicit dark text on all cards so both light and dark mode work ────
+# ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* Risk badges */
 .risk-clean  { background:#1e7e34; color:#ffffff !important; border-radius:6px;
                padding:3px 12px; font-weight:700; display:inline-block; }
 .risk-warn   { background:#d39e00; color:#ffffff !important; border-radius:6px;
                padding:3px 12px; font-weight:700; display:inline-block; }
 .risk-high   { background:#b21f2d; color:#ffffff !important; border-radius:6px;
                padding:3px 12px; font-weight:700; display:inline-block; }
-
-/* Hit cards — always dark text regardless of Streamlit theme */
 .hit-card     { border-left:4px solid #dc3545; background:#2a1215;
                 border-radius:4px; padding:9px 14px; margin-bottom:7px;
                 font-size:0.88rem; color:#f8d7da !important; }
@@ -43,11 +40,14 @@ st.markdown("""
 .hit-card-low { border-left:4px solid #0dcaf0; background:#07282e;
                 border-radius:4px; padding:9px 14px; margin-bottom:7px;
                 font-size:0.88rem; color:#cff4fc !important; }
-.hit-card     b, .hit-card-med b, .hit-card-low b  { font-weight:700; }
-.hit-card     code, .hit-card-med code, .hit-card-low code {
+.hit-card b, .hit-card-med b, .hit-card-low b { font-weight:700; }
+.hit-card code, .hit-card-med code, .hit-card-low code {
     background:rgba(255,255,255,0.12); color:inherit !important;
     padding:1px 5px; border-radius:3px; font-size:0.85em;
 }
+.breach-banner { background:#4a0a0a; border:1px solid #dc3545;
+                 border-radius:8px; padding:16px 20px; margin-bottom:16px;
+                 color:#f8d7da !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -55,16 +55,19 @@ st.markdown("""
 st.sidebar.title("🛡️ Compliance Pre-Scan")
 page = st.sidebar.radio(
     "Navigation",
-    ["📤 Upload & Scan", "📋 Audit Trail", "📥 Betriebsrat Export"],
+    [
+        "📤 Upload & Scan",
+        "📋 Audit Trail",
+        "📥 Betriebsrat Export",
+        "🚨 Datenpanne melden",
+    ],
     label_visibility="collapsed",
 )
 st.sidebar.markdown("---")
 st.sidebar.caption(f"Backend: `{BACKEND_URL}`")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _risk_badge(risk: str) -> str:
     cls = {
@@ -89,7 +92,7 @@ def _render_hits(title: str, hits: list[dict], color: str) -> None:
         return
     with st.expander(f"{title} ({len(hits)} hit{'s' if len(hits) != 1 else ''})", expanded=True):
         for h in hits:
-            css = _severity_class(h.get("severity", "LOW"))
+            css     = _severity_class(h.get("severity", "LOW"))
             snippet = h.get("match_snippet", "")
             rule    = h.get("rule_id", "")
             entity  = h.get("entity_type") or rule
@@ -120,10 +123,9 @@ if page == "📤 Upload & Scan":
         uploaded = st.file_uploader(
             "Select a file to scan",
             type=["pdf", "docx", "doc", "txt", "xlsx", "xlsm", "rtf"],
-            help="Supported: PDF, DOCX, TXT, XLSX, RTF",
         )
     with col2:
-        user_id    = st.text_input("User ID",    value="demo-user",    help="Passed to audit trail")
+        user_id    = st.text_input("User ID",    value="demo-user")
         session_id = st.text_input("Session ID", value="demo-session")
 
     if uploaded and st.button("🔍 Scan file", type="primary"):
@@ -166,16 +168,16 @@ if page == "📤 Upload & Scan":
 
         with st.expander("🗂 File identity", expanded=False):
             st.json({
-                "filename":          result.get("filename"),
-                "detected_type":     result.get("file_type_detected"),
-                "declared_type":     result.get("file_type_declared"),
+                "filename":           result.get("filename"),
+                "detected_type":      result.get("file_type_detected"),
+                "declared_type":      result.get("file_type_declared"),
                 "extension_mismatch": result.get("extension_mismatch"),
             })
 
-        _render_hits("🔑 Secrets",   result.get("secret_matches",  []), "#dc3545")
-        _render_hits("👤 PII",        result.get("pii_matches",     []), "#fd7e14")
-        _render_hits("🔤 Keywords",   result.get("keyword_matches", []), "#6f42c1")
-        _render_hits("⚠️ Anomalies",  result.get("anomaly_matches", []), "#0dcaf0")
+        _render_hits("🔑 Secrets",  result.get("secret_matches",  []), "#dc3545")
+        _render_hits("👤 PII",       result.get("pii_matches",     []), "#fd7e14")
+        _render_hits("🔤 Keywords",  result.get("keyword_matches", []), "#6f42c1")
+        _render_hits("⚠️ Anomalies", result.get("anomaly_matches", []), "#0dcaf0")
 
         st.session_state["last_result"] = result
 
@@ -191,24 +193,34 @@ elif page == "📋 Audit Trail":
 
     with st.form("filter_form"):
         fc1, fc2, fc3, fc4 = st.columns(4)
-        f_user  = fc1.text_input("User ID (optional)")
-        f_from  = fc2.date_input("From date", value=None)
-        f_to    = fc3.date_input("To date",   value=None)
-        f_limit = fc4.number_input("Max rows", min_value=10, max_value=500, value=100)
+        f_user   = fc1.text_input("User ID (optional)")
+        f_from   = fc2.date_input("From date", value=None)
+        f_to     = fc3.date_input("To date",   value=None)
+        f_limit  = fc4.number_input("Max rows", min_value=10, max_value=500, value=100)
+        f_action = st.selectbox(
+            "Filter by action",
+            ["", "PRE_SCAN_COMPLETED", "MANUAL_BREACH_REPORT"],
+            index=0,
+        )
         submitted = st.form_submit_button("🔎 Load events")
 
     if submitted or "audit_df" in st.session_state:
         params: dict = {"limit": int(f_limit)}
-        if f_user: params["user_id"]   = f_user
-        if f_from: params["from_date"] = str(f_from)
-        if f_to:   params["to_date"]   = str(f_to)
+        if f_user:   params["user_id"]   = f_user
+        if f_from:   params["from_date"] = str(f_from)
+        if f_to:     params["to_date"]   = str(f_to)
+        if f_action: params["action"]    = f_action
 
         if submitted:
             with st.spinner("Loading…"):
                 try:
-                    r = requests.get(f"{BACKEND_URL}/events", params=params, timeout=15)
+                    r = requests.get(
+                        f"{BACKEND_URL}/compliance/events",
+                        params=params, timeout=15,
+                    )
                     r.raise_for_status()
-                    st.session_state["audit_df"] = r.json()
+                    data = r.json()
+                    st.session_state["audit_df"] = data.get("events", [])
                 except requests.RequestException as exc:
                     st.error(f"Backend unreachable: {exc}")
                     st.stop()
@@ -221,22 +233,23 @@ elif page == "📋 Audit Trail":
             df = pd.DataFrame(events)
             display_cols = [
                 "timestamp", "user_id", "filename",
-                "risk_level", "decision",
+                "action", "risk_level", "decision",
                 "pii_count", "secret_count", "keyword_count",
-                "anomaly_flags", "scan_duration_ms",
+                "anomaly_flags", "breach_severity", "breach_reason",
+                "scan_duration_ms",
             ]
             df = df[[c for c in display_cols if c in df.columns]]
 
-            def _style_risk(val: str) -> str:
+            def _style_row(val: str) -> str:
                 return {
-                    "CLEAN":            "background-color:#1e7e34;color:#ffffff",
-                    "SENSITIVE_PII":    "background-color:#856404;color:#ffffff",
-                    "SECRET_FOUND":     "background-color:#721c24;color:#ffffff",
+                    "CLEAN":              "background-color:#1e7e34;color:#ffffff",
+                    "SENSITIVE_PII":      "background-color:#856404;color:#ffffff",
+                    "SECRET_FOUND":       "background-color:#721c24;color:#ffffff",
                     "STRUCTURAL_ANOMALY": "background-color:#721c24;color:#ffffff",
                 }.get(val, "")
 
             subset = ["risk_level"] if "risk_level" in df.columns else []
-            styled = df.style.applymap(_style_risk, subset=subset)
+            styled = df.style.applymap(_style_row, subset=subset)
             st.markdown(f"**{len(df)} events**")
             st.dataframe(styled, use_container_width=True, height=500)
 
@@ -267,9 +280,8 @@ elif page == "📥 Betriebsrat Export":
         with st.spinner("Generating export…"):
             try:
                 r = requests.get(
-                    f"{BACKEND_URL}/events/export",
-                    params=params,
-                    timeout=30,
+                    f"{BACKEND_URL}/compliance/events/export",
+                    params=params, timeout=30,
                 )
                 r.raise_for_status()
                 csv_bytes = r.content
@@ -285,10 +297,98 @@ elif page == "📥 Betriebsrat Export":
             mime="text/csv",
         )
 
-        import io
         try:
             preview_df = pd.read_csv(io.BytesIO(csv_bytes), encoding="utf-8-sig", nrows=20)
             st.markdown("**Preview (first 20 rows):**")
             st.dataframe(preview_df, use_container_width=True)
         except Exception:
             pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Page 4 — Datenpanne melden  (Manual breach report)
+# ─────────────────────────────────────────────────────────────────────────────
+elif page == "🚨 Datenpanne melden":
+    st.title("🚨 Datenpanne melden")
+
+    st.markdown(
+        '<div class="breach-banner">'
+        "<b>Hinweis:</b> Nutzen Sie dieses Formular, um eine manuelle Datenschutzverletzung "
+        "oder einen Compliance-Verdacht zu melden. Der Eintrag wird sofort und unveränderlich "
+        "im Audit-Trail gespeichert und ist für den Betriebsrat und die Compliance-Abteilung "
+        "einsehbar."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    with st.form("breach_form"):
+        bc1, bc2 = st.columns(2)
+        b_user     = bc1.text_input("Ihre User-ID *", placeholder="max.mustermann")
+        b_reporter = bc2.text_input("Melder (Name oder Rolle)", placeholder="Datenschutzbeauftragter")
+
+        bc3, bc4 = st.columns(2)
+        b_filename  = bc3.text_input("Betroffene Datei (optional)", placeholder="vertrag.pdf")
+        b_upload_id = bc4.text_input("Upload-ID (optional)", placeholder="aus dem Scan-Ergebnis")
+
+        b_severity = st.selectbox(
+            "Schweregrad *",
+            ["LOW", "MEDIUM", "HIGH", "CRITICAL"],
+            index=2,
+        )
+
+        b_reason = st.text_area(
+            "Beschreibung der Datenpanne / des Verdachts *",
+            height=160,
+            placeholder=(
+                "z. B.: Datei enthielt Personalakten mehrerer Mitarbeiter und wurde versehentlich "
+                "in den Chat hochgeladen. IBAN und Privatadresse sichtbar."
+            ),
+        )
+
+        b_session = st.text_input("Session-ID (optional)")
+
+        submit_breach = st.form_submit_button("📋 Meldung absenden", type="primary")
+
+    if submit_breach:
+        if not b_user.strip():
+            st.error("Bitte geben Sie Ihre User-ID an.")
+        elif not b_reason.strip():
+            st.error("Bitte beschreiben Sie die Datenpanne.")
+        else:
+            payload = {
+                "user_id":    b_user.strip(),
+                "session_id": b_session.strip(),
+                "upload_id":  b_upload_id.strip(),
+                "filename":   b_filename.strip() or "(nicht angegeben)",
+                "reason":     b_reason.strip(),
+                "severity":   b_severity,
+                "reporter":   b_reporter.strip() or b_user.strip(),
+            }
+            with st.spinner("Meldung wird gespeichert…"):
+                try:
+                    r = requests.post(
+                        f"{BACKEND_URL}/compliance/breach-report",
+                        json=payload,
+                        timeout=15,
+                    )
+                    r.raise_for_status()
+                    event = r.json().get("event", {})
+                except requests.RequestException as exc:
+                    st.error(f"Backend nicht erreichbar: {exc}")
+                    st.stop()
+
+            st.success("✅ Meldung wurde erfolgreich im Audit-Trail gespeichert.")
+            st.markdown("**Audit-Event-ID:**")
+            st.code(event.get("id", "n/a"))
+            st.json({
+                "timestamp":  event.get("timestamp"),
+                "action":     event.get("action"),
+                "severity":   event.get("severity"),
+                "reporter":   event.get("reporter"),
+                "upload_id":  event.get("upload_id"),
+                "filename":   event.get("filename"),
+            })
+            st.info(
+                "Die Meldung ist jetzt in der **Audit-Trail**-Ansicht unter "
+                "'MANUAL_BREACH_REPORT' einsehbar und im Betriebsrat-CSV-Export enthalten."
+            )

@@ -1,5 +1,6 @@
 """SQLite schema initialisation and async read/write helpers."""
 import json
+import uuid
 from pathlib import Path
 
 import aiosqlite
@@ -22,7 +23,10 @@ CREATE TABLE IF NOT EXISTS compliance_events (
     secret_count     INTEGER DEFAULT 0,
     keyword_count    INTEGER DEFAULT 0,
     anomaly_flags    TEXT    DEFAULT '[]',
-    scan_duration_ms INTEGER
+    scan_duration_ms INTEGER,
+    breach_reason    TEXT,
+    breach_severity  TEXT,
+    breach_reporter  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS compliance_rule_hits (
@@ -39,6 +43,7 @@ CREATE TABLE IF NOT EXISTS compliance_rule_hits (
 
 CREATE INDEX IF NOT EXISTS idx_events_user   ON compliance_events(user_id);
 CREATE INDEX IF NOT EXISTS idx_events_ts     ON compliance_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_events_action ON compliance_events(action);
 CREATE INDEX IF NOT EXISTS idx_hits_event    ON compliance_rule_hits(event_id);
 """
 
@@ -48,6 +53,16 @@ async def init_db() -> None:
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(settings.db_path) as db:
         await db.executescript(DDL)
+        # Add new columns to existing DBs (safe: fails silently if already present)
+        for col_sql in [
+            "ALTER TABLE compliance_events ADD COLUMN breach_reason   TEXT",
+            "ALTER TABLE compliance_events ADD COLUMN breach_severity  TEXT",
+            "ALTER TABLE compliance_events ADD COLUMN breach_reporter  TEXT",
+        ]:
+            try:
+                await db.execute(col_sql)
+            except Exception:
+                pass
         await db.commit()
 
 
@@ -59,8 +74,6 @@ async def write_event(
     result: ScanResult,
 ) -> AuditEvent:
     """Persist one scan result as an audit event + individual rule hits."""
-    import uuid
-
     anomaly_flag_ids = [h.rule_id for h in result.anomaly_matches]
 
     event = AuditEvent(
@@ -123,10 +136,57 @@ async def write_event(
     return event
 
 
+async def write_breach_report(
+    user_id: str,
+    session_id: str,
+    upload_id: str,
+    filename: str,
+    reason: str,
+    severity: str,
+    reporter: str,
+) -> dict:
+    """Write a manual MANUAL_BREACH_REPORT event to the audit trail."""
+    from datetime import datetime, timezone
+
+    event_id = str(uuid.uuid4())
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    async with aiosqlite.connect(settings.db_path) as db:
+        await db.execute(
+            """
+            INSERT INTO compliance_events
+              (id, timestamp, user_id, session_id, upload_id, filename,
+               action, risk_level, decision,
+               pii_count, secret_count, keyword_count, anomaly_flags,
+               scan_duration_ms, breach_reason, breach_severity, breach_reporter)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                event_id, timestamp, user_id, session_id,
+                upload_id, filename,
+                "MANUAL_BREACH_REPORT", "SENSITIVE_PII", "BLOCK",
+                0, 0, 0, "[]", 0,
+                reason, severity, reporter,
+            ),
+        )
+        await db.commit()
+
+    return {
+        "id": event_id,
+        "timestamp": timestamp,
+        "action": "MANUAL_BREACH_REPORT",
+        "severity": severity,
+        "reporter": reporter,
+        "upload_id": upload_id,
+        "filename": filename,
+    }
+
+
 async def list_events(
     user_id: str | None = None,
     from_date: str | None = None,
     to_date: str | None = None,
+    action: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> list[dict]:
@@ -143,12 +203,16 @@ async def list_events(
     if to_date:
         clauses.append("timestamp <= ?")
         params.append(to_date + "T23:59:59")
+    if action:
+        clauses.append("action = ?")
+        params.append(action)
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     sql = f"""
         SELECT id, timestamp, user_id, session_id, upload_id, filename,
                action, risk_level, decision, pii_count, secret_count,
-               keyword_count, anomaly_flags, scan_duration_ms
+               keyword_count, anomaly_flags, scan_duration_ms,
+               breach_reason, breach_severity, breach_reporter
         FROM compliance_events
         {where}
         ORDER BY timestamp DESC
