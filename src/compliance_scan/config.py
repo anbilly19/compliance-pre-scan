@@ -11,21 +11,23 @@ class Settings(BaseSettings):
     db_path: Path = Path("data/compliance.db")
 
     # ── Warn thresholds ───────────────────────────────────────────────────────
-    # Decision becomes ALLOW_WITH_WARNING when hit count >= threshold.
     pii_warn_threshold: int = 1
     secret_warn_threshold: int = 1
     keyword_warn_threshold: int = 1
 
     # ── BLOCK thresholds ──────────────────────────────────────────────────────
-    # Set to a positive integer to hard-block uploads above that hit count.
-    # Set to 0 (default) to disable blocking for that category.
-    #
-    # block_on_secret=1  → any secret hit → HTTP 451 + BLOCK decision
-    # block_on_pii=10    → 10+ PII hits   → HTTP 451 + BLOCK decision
-    # block_on_structural_anomaly=True → any HIGH anomaly (ext mismatch etc.) → BLOCK
     block_on_secret: int = 1
-    block_on_pii: int = 0                  # 0 = warn only, never hard-block
+    block_on_pii: int = 0
     block_on_structural_anomaly: bool = True
+
+    # ── Hit masking (Phase 11) ────────────────────────────────────────────────
+    # False (default) — full snippets stored and returned; useful for dev/test
+    # True            — snippets masked before DB write + API response; use in production
+    #
+    # PII:    keep first 2 + last 2 chars  e.g. 'max.mustermann@firma.de' → 'ma***de'
+    # SECRET: keep first 4 chars only      e.g. 'AKIAIOSFODNN7EXAMPLE'   → 'AKIA****'
+    # KEYWORD / ANOMALY: pass through unchanged
+    mask_snippets: bool = False
 
     # Anomaly heuristics
     entropy_high_threshold: float = 7.2
@@ -35,7 +37,7 @@ class Settings(BaseSettings):
     # Export
     export_pseudonymise_users: bool = False
 
-    # Custom keyword lists (comma-separated paths to YAML files)
+    # Custom keyword lists
     keyword_config_paths: list[Path] = [Path("config/keywords.yml")]
 
 
