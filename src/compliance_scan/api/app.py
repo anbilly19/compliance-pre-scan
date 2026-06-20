@@ -16,7 +16,7 @@ from ..audit.models import Decision, ScanResult
 from ..pipeline import run_scan
 
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".txt", ".rtf"}
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xlsm", ".txt", ".rtf", ".zip"}
 HTTP_BLOCKED = 451
 
 

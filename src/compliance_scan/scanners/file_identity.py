@@ -14,6 +14,7 @@ _ALLOWED_MIMES = {
     "application/rtf",
     "application/msword",         # legacy .doc
     "application/vnd.ms-excel",   # legacy .xls
+    "application/zip",
 }
 
 _EXT_MIME_MAP = {
@@ -24,6 +25,22 @@ _EXT_MIME_MAP = {
     ".xlsm": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".txt":  "text/plain",
     ".rtf":  "text/rtf",
+    ".zip":  "application/zip",
+}
+
+# MIME types that represent known document/text families.
+# When a file claims one of these via its extension but puremagic
+# cannot identify it (returns octet-stream), treat that as suspicious.
+_DOCUMENT_MIMES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/msword",
+    "application/vnd.ms-excel",
+    "text/plain",
+    "text/rtf",
+    "application/rtf",
+    "application/zip",
 }
 
 
@@ -44,20 +61,22 @@ def identify_file(path: Path) -> FileIdentity:
     try:
         matches = puremagic.magic_file(str(path))
         if matches:
-            # puremagic returns a list of PureMagicWithConfidence; take highest confidence
             matches.sort(key=lambda m: m.confidence, reverse=True)
             mime_detected = matches[0].mime_type or "application/octet-stream"
     except Exception:  # noqa: BLE001
         pass
 
-    # Mismatch: detected type and extension-expected type differ in major family
     def _major(mime: str) -> str:
         return mime.split("/")[0]
 
-    mismatch = (
-        mime_detected != "application/octet-stream"
-        and _major(mime_detected) != _major(mime_from_ext)
-    )
+    if mime_detected == "application/octet-stream":
+        # puremagic couldn't identify the file.
+        # If the extension promises a known document type, flag as mismatch:
+        # "unknown binary data pretending to be a document" is suspicious.
+        mismatch = mime_from_ext in _DOCUMENT_MIMES
+    else:
+        # Both sides are known: flag when major MIME families differ.
+        mismatch = _major(mime_detected) != _major(mime_from_ext)
 
     return FileIdentity(
         mime_detected=mime_detected,
