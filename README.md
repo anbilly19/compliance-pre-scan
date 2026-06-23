@@ -3,6 +3,8 @@
 > Local, LLM-free pre-upload compliance scanner for enterprise chat platforms.  
 > Runs **before** any file reaches the LLM agent — flags sensitive data, credentials, and suspicious content, then writes an immutable audit trail.
 
+> **CPU-only.** No GPU is required or used at any point. All scanners (PII, secrets, keywords, anomaly heuristics) run on CPU. The spaCy NER models used by Presidio are loaded in CPU mode. This makes the service suitable for air-gapped and resource-constrained environments.
+
 ---
 
 ## Status
@@ -28,18 +30,18 @@
 When a user selects a file for upload in the chat platform, this service intercepts it **before** it reaches the LLM agent and runs a multi-layer scan:
 
 1. **File identity check** — validates MIME type vs. declared extension (catches disguised payloads)
-2. **Text extraction** — pulls raw text from PDF, DOCX, XLSX, TXT, RTF
+2. **Text extraction** — pulls raw text from PDF, DOCX, XLSX, TXT, RTF, ZIP
 3. **PII detection** — finds personal identifiers using Microsoft Presidio with bilingual EN + DE NER and regex recognisers
 4. **Secret / credential scanning** — detects API keys, tokens, DB connection strings, passwords
 5. **Custom keyword matching** — organisation-specific terms: project names, internal IDs, confidentiality markers
-6. **Structural anomaly heuristics** — entropy, size-vs-text ratio, extension mismatch, embedded macros/OLE objects
+6. **Structural anomaly heuristics** — entropy, size-vs-text ratio, extension mismatch, embedded macros/OLE objects, archive bomb detection
 7. **False-positive suppression** — technical procurement docs and financial cost sheets suppress irrelevant NER hits automatically
 8. **Policy decision** — maps scan results to a risk level and decision via OPA/Rego or inline Python fallback
 9. **Hit masking** — when `MASK_SNIPPETS=true`, sensitive snippets are masked before DB write and API response
 10. **Audit event log** — every scan and manual breach report is appended as an immutable SQLite row
 11. **Betriebsrat CSV export** — date-range filtered export for works council / internal audit
 
-No LLMs are used at any point. All processing is local and offline-capable.
+No LLMs are used at any point. All processing is local, offline-capable, and CPU-only.
 
 ---
 
@@ -93,11 +95,11 @@ No LLMs are used at any point. All processing is local and offline-capable.
 
 | Check | Trigger condition | Severity |
 |-------|-------------------|----------|
-| Extension mismatch | MIME magic ≠ declared extension | HIGH |
+| Extension mismatch | MIME magic ≠ declared extension (including unknown binary claiming to be a document) | HIGH |
 | High entropy | Shannon entropy > threshold (likely encrypted/compressed payload) | MEDIUM |
 | Size vs text ratio | File size >> extracted text length (hidden binary content) | MEDIUM |
 | Embedded macro | DOCX/XLSX contains VBA macros or OLE objects | MEDIUM |
-| Archive bomb | ZIP recursion depth or unpacked size exceeds limits | HIGH |
+| Archive bomb | ZIP recursion depth exceeds `MAX_ARCHIVE_DEPTH` (default: 2) | HIGH |
 
 ---
 
@@ -163,22 +165,25 @@ OPA_URL=http://localhost:8181
 | XLSX | `openpyxl` |
 | TXT | built-in |
 | RTF | `striprtf` |
+| ZIP | `zipfile` (stdlib) — scanned for archive bombs and inner file content |
 
 ---
 
 ## Tech stack
 
-| Layer | Choice | License |
-|-------|--------|---------|
-| API | FastAPI + uvicorn | MIT |
-| UI | Streamlit | Apache-2.0 |
-| PII detection | [Microsoft Presidio](https://github.com/microsoft/presidio) + spaCy | MIT |
-| NLP models | `en_core_web_md`, `de_core_news_md` | MIT / CC-BY-SA-3.0 |
-| File type detection | `puremagic` | MIT |
-| Secret scanning | Custom regex (Gitleaks-inspired, written from scratch) | MIT |
-| Audit storage | SQLite via `aiosqlite` | MIT |
-| Language detection | `langdetect` | Apache-2.0 |
-| Policy engine | Inline Python + optional [OPA](https://www.openpolicyagent.org/) / Rego | Apache-2.0 |
+| Layer | Choice | License | GPU required? |
+|-------|--------|---------|---------------|
+| API | FastAPI + uvicorn | MIT | No |
+| UI | Streamlit | Apache-2.0 | No |
+| PII detection | [Microsoft Presidio](https://github.com/microsoft/presidio) + spaCy | MIT | **No — CPU only** |
+| NLP models | `en_core_web_md`, `de_core_news_md` | MIT / CC-BY-SA-3.0 | **No — CPU only** |
+| File type detection | `puremagic` | MIT | No |
+| Secret scanning | Custom regex (Gitleaks-inspired, written from scratch) | MIT | No |
+| Audit storage | SQLite via `aiosqlite` | MIT | No |
+| Language detection | `langdetect` | Apache-2.0 | No |
+| Policy engine | Inline Python + optional [OPA](https://www.openpolicyagent.org/) / Rego | Apache-2.0 | No |
+
+> No component in this stack requires or uses a GPU. The service runs on any standard CPU-only server or developer laptop.
 
 ---
 
@@ -191,6 +196,8 @@ compliance-pre-scan/
 ├── pyproject.toml
 ├── .env.example
 ├── debug_scan.py
+├── scripts/
+│   └── smoke_test.ps1          ← manual end-to-end test against running server
 ├── config/
 │   ├── keywords/
 │   └── policy/
@@ -227,6 +234,14 @@ uv sync
 uvicorn compliance_scan.api.app:app --reload
 streamlit run ui/app.py
 ```
+
+**Smoke test against the running server (PowerShell):**
+
+```powershell
+.\scripts\smoke_test.ps1
+```
+
+Creates synthetic test files and runs 8 scenarios (clean file, AWS key, PII, Betriebsrat keywords, JWT, extension mismatch, unsupported type, ZIP bomb). Prints colour-coded PASS/FAIL per scenario, dumps the audit trail, and saves a Betriebsrat CSV.
 
 ---
 
@@ -282,8 +297,8 @@ CREATE TABLE compliance_events (
 | Method | Path | Status | Description |
 |--------|------|--------|-------------|
 | `POST` | `/scan` | 200 / 451 / 415 | Pre-upload scan; **451 = BLOCK** |
-| `GET` | `/compliance/events` | 200 | List audit events |
-| `GET` | `/compliance/events/export` | 200 | Betriebsrat CSV download |
+| `GET` | `/events` | 200 | List audit events |
+| `GET` | `/events/export` | 200 | Betriebsrat CSV download |
 | `POST` | `/compliance/breach-report` | 201 | Manual breach report |
 
 ---
